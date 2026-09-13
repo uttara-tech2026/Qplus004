@@ -311,17 +311,20 @@ async def handle_join_request(event: ChatJoinRequest, bot: Bot):
     pool = await get_pool()
     async with pool.acquire() as conn:
         dest = await conn.fetchrow(
-            "SELECT accept_requests, title FROM destinations WHERE chat_id = $1", chat_id
+            "SELECT accept_requests, is_unmatured, title FROM destinations WHERE chat_id = $1", chat_id
         )
         await conn.execute(
             "INSERT INTO join_requests (chat_id, user_id, status) VALUES ($1, $2, 'pending') ON CONFLICT (chat_id, user_id) DO NOTHING",
             chat_id, user_id
         )
 
-    if dest and dest["accept_requests"]:
-        if chat_id not in active_join_tasks or active_join_tasks[chat_id].done():
-            task = asyncio.create_task(join_request_worker(bot, chat_id))
-            active_join_tasks[chat_id] = task
+    if dest:
+        # Matured channels auto-accept by default; Unmatured channels only accept if accept_requests is True
+        should_process = (not dest["is_unmatured"]) or dest["accept_requests"]
+        if should_process:
+            if chat_id not in active_join_tasks or active_join_tasks[chat_id].done():
+                task = asyncio.create_task(join_request_worker(bot, chat_id))
+                active_join_tasks[chat_id] = task
 
 
 async def join_request_worker(bot: Bot, chat_id: str):
@@ -329,11 +332,15 @@ async def join_request_worker(bot: Bot, chat_id: str):
         pool = await get_pool()
         async with pool.acquire() as conn:
             dest = await conn.fetchrow(
-                "SELECT title, accept_requests, join_delay_min, join_delay_max FROM destinations WHERE chat_id = $1",
+                "SELECT title, is_unmatured, accept_requests, join_delay_min, join_delay_max FROM destinations WHERE chat_id = $1",
                 chat_id
             )
 
-        if not dest or not dest["accept_requests"]:
+        if not dest:
+            return
+        
+        # If unmatured and accepting is paused, don't run
+        if dest["is_unmatured"] and not dest["accept_requests"]:
             return
 
         chat_title = dest["title"] or chat_id
@@ -344,10 +351,12 @@ async def join_request_worker(bot: Bot, chat_id: str):
         while True:
             pool = await get_pool()
             async with pool.acquire() as conn:
-                active = await conn.fetchval(
-                    "SELECT accept_requests FROM destinations WHERE chat_id = $1", chat_id
+                current_dest = await conn.fetchrow(
+                    "SELECT is_unmatured, accept_requests FROM destinations WHERE chat_id = $1", chat_id
                 )
-                if not active:
+                if not current_dest:
+                    break
+                if current_dest["is_unmatured"] and not current_dest["accept_requests"]:
                     break
 
                 row = await conn.fetchrow(
@@ -376,10 +385,12 @@ async def join_request_worker(bot: Bot, chat_id: str):
             await asyncio.sleep(sleep_duration)
 
         if accepted_count > 0:
+            type_label = "Unmatured Channel" if dest["is_unmatured"] else "Matured Channel"
             await dispatch_notification(
                 bot,
                 f"🤝 <b>Join Requests Auto-Approved</b>\n\n"
-                f"• <b>Destination:</b> <b>{chat_title}</b> (<code>{chat_id}</code>)\n"
+                f"• <b>Destination:</b> <b>{chat_title}</b> ({type_label})\n"
+                f"• <b>ID:</b> <code>{chat_id}</code>\n"
                 f"• <b>Total Accepted in Run:</b> <code>{accepted_count}</code> member(s)\n"
                 f"• <b>Random Delay:</b> <code>{min_delay}s - {max_delay}s</code>"
             )
@@ -566,8 +577,8 @@ async def bot_added_as_admin(event: ChatMemberUpdated, bot: Bot):
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO destinations (chat_id, title, chat_type)
-            VALUES ($1, $2, $3)
+            INSERT INTO destinations (chat_id, title, chat_type, is_unmatured, accept_requests)
+            VALUES ($1, $2, $3, FALSE, TRUE)
             ON CONFLICT(chat_id) DO UPDATE SET title = EXCLUDED.title, chat_type = EXCLUDED.chat_type
             """,
             chat_id, chat_title, chat_type
@@ -577,8 +588,9 @@ async def bot_added_as_admin(event: ChatMemberUpdated, bot: Bot):
         f"📢 <b>New Destination Connected!</b>\n\n"
         f"• <b>Title:</b> {chat_title}\n"
         f"• <b>ID:</b> <code>{chat_id}</code>\n"
-        f"• <b>Type:</b> {chat_type.capitalize()}\n\n"
-        "You can configure this as a Broadcast Destination, Unmatured Destination, or Master Log Channel."
+        f"• <b>Type:</b> {chat_type.capitalize()}\n"
+        f"• <b>Default Category:</b> 🟢 Matured Channel (Auto-Accept Joins Active)\n\n"
+        "Configure settings or convert to Unmatured channel in <b>Available Destinations</b>."
     )
     await dispatch_notification(bot, log_msg)
 
@@ -617,10 +629,9 @@ def get_user_main_kb() -> ReplyKeyboardMarkup:
 async def get_admin_main_kb() -> InlineKeyboardMarkup:
     pool = await get_pool()
     async with pool.acquire() as conn:
-        dest_count = await conn.fetchval("SELECT COUNT(*) FROM destinations")
-        master_log = await conn.fetchval(
-            "SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'"
-        )
+        matured_count = await conn.fetchval("SELECT COUNT(*) FROM destinations WHERE is_unmatured = FALSE") or 0
+        unmatured_count = await conn.fetchval("SELECT COUNT(*) FROM destinations WHERE is_unmatured = TRUE") or 0
+        master_log = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
 
     master_label = f"📋 Master Log: {master_log[:15]}..." if master_log else "📋 Set Master Log"
 
@@ -629,7 +640,7 @@ async def get_admin_main_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📂 Manage Queues", callback_data="admin_manage_hub")],
             [InlineKeyboardButton(text="📈 Matrix", callback_data="admin_matrix_hub")],
             [InlineKeyboardButton(text="👤 Add Flezen Uploader", callback_data="admin_add_uploader")],
-            [InlineKeyboardButton(text=f"📡 Available Destinations ({dest_count})", callback_data="admin_view_destinations")],
+            [InlineKeyboardButton(text=f"📡 Available Destinations (🟢{matured_count} | ⚪{unmatured_count})", callback_data="admin_view_destinations")],
             [InlineKeyboardButton(text=master_label, callback_data="admin_set_master_log_screen")],
             [InlineKeyboardButton(text="❌ Close Menu", callback_data="admin_close")]
         ]
@@ -675,37 +686,31 @@ async def cmd_addest(message: Message, command: CommandObject):
 
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # Defaults to Matured Channel (Auto-Accept enabled)
         await conn.execute(
             """
-            INSERT INTO destinations (chat_id, title, chat_type, is_unmatured)
-            VALUES ($1, $2, 'channel', FALSE)
+            INSERT INTO destinations (chat_id, title, chat_type, is_unmatured, accept_requests)
+            VALUES ($1, $2, 'channel', FALSE, TRUE)
             ON CONFLICT (chat_id) DO UPDATE SET title = EXCLUDED.title
             """,
             numerical_id, nickname
         )
-        queues = await conn.fetch("SELECT id, name FROM queues ORDER BY id ASC")
-
-    if not queues:
-        await message.answer(
-            f"✅ <b>Destination Registered Successfully!</b>\n\n"
-            f"• <b>Name:</b> {nickname}\n"
-            f"• <b>ID:</b> <code>{numerical_id}</code>\n\n"
-            "⚠️ <i>Please create a queue first so you can bind this destination as a broadcast target.</i>",
-            parse_mode="HTML"
-        )
-        return
 
     buttons = [
-        [InlineKeyboardButton(text=f"📁 Bind as Target for: {q['name']}", callback_data=f"confirm_broadcast_bind:{numerical_id}:{q['id']}")]
-        for q in queues
+        [
+            InlineKeyboardButton(text="🟢 Keep as Matured", callback_data=f"dest_actions:{numerical_id}"),
+            InlineKeyboardButton(text="⚪ Set as Unmatured", callback_data=f"dest_convert_unmatured:{numerical_id}")
+        ],
+        [InlineKeyboardButton(text="📁 Assign to Queue", callback_data=f"dest_pick_queue:{numerical_id}")],
+        [InlineKeyboardButton(text="⚙️ Open Destination Actions", callback_data=f"dest_actions:{numerical_id}")]
     ]
-    buttons.append([InlineKeyboardButton(text="⚙️ Open Destination Actions", callback_data=f"dest_actions:{numerical_id}")])
 
     await message.answer(
         f"✅ <b>Destination Registered Successfully!</b>\n\n"
         f"• <b>Name:</b> {nickname}\n"
-        f"• <b>ID:</b> <code>{numerical_id}</code>\n\n"
-        "Select which broadcast queue should deliver to this destination:",
+        f"• <b>ID:</b> <code>{numerical_id}</code>\n"
+        f"• <b>Current Type:</b> 🟢 <b>Matured Channel</b> (Auto-Accepts Joins)\n\n"
+        "Choose category or assign to a queue below:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
@@ -749,7 +754,7 @@ async def admin_matrix_dest_perm(callback: CallbackQuery, bot: Bot):
         return
     pool = await get_pool()
     async with pool.acquire() as conn:
-        dests = await conn.fetch("SELECT chat_id, title FROM destinations ORDER BY title ASC")
+        dests = await conn.fetch("SELECT chat_id, title, is_unmatured FROM destinations ORDER BY is_unmatured ASC, title ASC")
 
     if not dests:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_matrix_hub")]])
@@ -758,8 +763,9 @@ async def admin_matrix_dest_perm(callback: CallbackQuery, bot: Bot):
 
     report = ["📡 <b>Destination Broadcast Permission Status:</b>\n"]
     for d in dests:
+        cat_badge = "⚪ Unmatured" if d["is_unmatured"] else "🟢 Matured"
         status_str = await check_bot_broadcast_permission(bot, d["chat_id"])
-        report.append(f"• <b>{d['title'] or d['chat_id']}</b>: {status_str}")
+        report.append(f"• <b>{d['title'] or d['chat_id']}</b> [{cat_badge}]: {status_str}")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Re-check Permissions", callback_data="admin_matrix_dest_perm")],
@@ -780,23 +786,29 @@ async def admin_matrix_joining(callback: CallbackQuery):
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        destinations = await conn.fetch("SELECT * FROM destinations ORDER BY title ASC")
+        destinations = await conn.fetch("SELECT * FROM destinations ORDER BY is_unmatured ASC, title ASC")
         pending_map = {row["chat_id"]: row["count"] for row in await conn.fetch("SELECT chat_id, COUNT(*) as count FROM join_requests WHERE status='pending' GROUP BY chat_id")}
 
     report = ["🤝 <b>Destination Joining & Approval Stats:</b>\n"]
     for d in destinations:
         cid = d["chat_id"]
         title = d["title"] or cid
+        is_unm = d["is_unmatured"]
         accepting = d["accept_requests"]
         pending = pending_map.get(cid, 0)
-        status_tag = "🟢 Accepting Joining" if accepting else "⚪ Pause Joining"
+        
+        cat_tag = "⚪ Unmatured" if is_unm else "🟢 Matured"
+        if is_unm:
+            status_tag = "🟢 Accepting Joins" if accepting else "⚪ Paused Joining"
+        else:
+            status_tag = "🟢 Auto-Accept Active"
 
         d_app = await pool.fetchval("SELECT COUNT(*) FROM join_requests WHERE chat_id=$1 AND status='accepted' AND approved_at >= $2", cid, day_ago)
         w_app = await pool.fetchval("SELECT COUNT(*) FROM join_requests WHERE chat_id=$1 AND status='accepted' AND approved_at >= $2", cid, week_ago)
         m_app = await pool.fetchval("SELECT COUNT(*) FROM join_requests WHERE chat_id=$1 AND status='accepted' AND approved_at >= $2", cid, month_ago)
 
         report.append(
-            f"• <b>{title}</b> (ID: <code>{cid}</code>)\n"
+            f"• <b>{title}</b> [{cat_tag}] (ID: <code>{cid}</code>)\n"
             f"  ├ Status: {status_tag}\n"
             f"  ├ Pending Requests: <code>{pending}</code>\n"
             f"  └ Approved | Day: <code>{d_app}</code> | Week: <code>{w_app}</code> | Month: <code>{m_app}</code>\n"
@@ -811,7 +823,7 @@ async def admin_matrix_joining(callback: CallbackQuery):
 
 # ==================== BROADCAST WORKER ====================
 
-async def broadcast_worker(bot: Bot, queue_id: int):
+async def broadcast_worker(bot: Bot, queue_id: int, target_scope: str = "both"):
     admin_chat_id = get_admin_id()
     admin_msg_id: Optional[int] = None
     master_msg_id: Optional[int] = None
@@ -826,8 +838,14 @@ async def broadcast_worker(bot: Bot, queue_id: int):
                 "SELECT name, destination, delay_sec, delay_min, delay_max, delay_type, mode FROM queues WHERE id = $1",
                 queue_id
             )
-            unmatured_targets = await conn.fetch(
-                "SELECT chat_id, title FROM destinations WHERE assigned_queue_id = $1", queue_id
+            # Fetch destinations assigned to this queue or matching legacy queue.destination
+            assigned_dests = await conn.fetch(
+                """
+                SELECT chat_id, title, is_unmatured 
+                FROM destinations 
+                WHERE assigned_queue_id = $1 OR chat_id = $2
+                """,
+                queue_id, q["destination"] if q else None
             )
             master_dest = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
             items = await conn.fetch(
@@ -838,21 +856,28 @@ async def broadcast_worker(bot: Bot, queue_id: int):
         if not q or not items:
             return
 
+        # Filter destinations according to chosen target scope: 'matured', 'unmatured', or 'both'
         target_chat_ids = []
         target_titles = []
 
-        if q["destination"]:
-            target_chat_ids.append(q["destination"])
-            async with pool.acquire() as conn:
-                d = await conn.fetchrow("SELECT title FROM destinations WHERE chat_id = $1", q["destination"])
-            target_titles.append(d["title"] if d else q["destination"])
+        for d in assigned_dests:
+            cid = d["chat_id"]
+            is_unm = d["is_unmatured"]
+            cat_name = "Unmatured" if is_unm else "Matured"
 
-        for u in unmatured_targets:
-            if u["chat_id"] not in target_chat_ids:
-                target_chat_ids.append(u["chat_id"])
-                target_titles.append(f"{u['title']} (Unmatured)")
+            if target_scope == "matured" and is_unm:
+                continue
+            if target_scope == "unmatured" and not is_unm:
+                continue
+
+            if cid not in target_chat_ids:
+                target_chat_ids.append(cid)
+                target_titles.append(f"{d['title'] or cid} ({cat_name})")
 
         if not target_chat_ids:
+            no_dest_text = f"⚠️ <b>Broadcast Cancelled:</b> No matching <b>{target_scope.capitalize()}</b> destinations are assigned to queue <code>{q['name']}</code>."
+            if admin_chat_id:
+                await safe_send_message(bot, admin_chat_id, no_dest_text)
             return
 
         qname = q["name"]
@@ -873,12 +898,14 @@ async def broadcast_worker(bot: Bot, queue_id: int):
             "eta_seconds": 0.0,
             "destination": dest_display,
             "mode": mode,
-            "delay_type": delay_type
+            "delay_type": delay_type,
+            "scope": target_scope.upper()
         }
 
         init_text = (
             f"🚀 <b>Broadcast Started</b>\n\n"
             f"• <b>Queue:</b> <code>{qname}</code>\n"
+            f"• <b>Scope:</b> <code>{target_scope.upper()}</code>\n"
             f"• <b>Target Channels:</b> <b>{dest_display}</b>\n"
             f"• <b>Total Posts:</b> <code>{total_posts}</code>\n"
             f"• <b>Order:</b> <code>{mode.upper()}</code>\n"
@@ -930,7 +957,7 @@ async def broadcast_worker(bot: Bot, queue_id: int):
 
             if remaining_posts > 0:
                 progress_text = (
-                    f"🚀 <b>Running Queue: {qname}</b>\n\n"
+                    f"🚀 <b>Running Queue: {qname}</b> [{target_scope.upper()}]\n\n"
                     f"• <b>Destinations:</b> <b>{dest_display}</b>\n"
                     f"• <b>Progress:</b> Completed <code>{sent_count}</code> out of <code>{total_posts}</code>\n"
                     f"• <b>Estimated Time Remaining:</b> <code>{eta_str}</code>\n"
@@ -947,7 +974,8 @@ async def broadcast_worker(bot: Bot, queue_id: int):
         final_text = (
             f"🏁 <b>Broadcast Completed Successfully!</b>\n\n"
             f"• <b>Queue:</b> <code>{qname}</code>\n"
-            f"• <b>Delivered Destinations:</b> <b>{dest_display}</b>\n"
+            f"• <b>Delivered Scope:</b> <code>{target_scope.upper()}</code>\n"
+            f"• <b>Destinations:</b> <b>{dest_display}</b>\n"
             f"• <b>Total Processed:</b> <code>{sent_count} / {total_posts}</code> posts\n"
             f"• <b>Status:</b> Finished & Idle"
         )
@@ -979,7 +1007,7 @@ async def admin_global_process_stats(callback: CallbackQuery):
     pool = await get_pool()
     async with pool.acquire() as conn:
         all_queues = await conn.fetch("SELECT id, name, destination, delay_sec, mode, run_count FROM queues ORDER BY id ASC")
-        destinations = await conn.fetch("SELECT chat_id, title, is_unmatured, accept_requests, join_delay_min, join_delay_max, posts_delivered, total_accepted FROM destinations ORDER BY title ASC")
+        destinations = await conn.fetch("SELECT chat_id, title, is_unmatured, accept_requests, join_delay_min, join_delay_max, posts_delivered, total_accepted FROM destinations ORDER BY is_unmatured ASC, title ASC")
         queue_post_counts = await conn.fetch("SELECT queue_id, COUNT(*) as count FROM posts GROUP BY queue_id")
         join_pending_counts = await conn.fetch("SELECT chat_id, COUNT(*) as count FROM join_requests WHERE status = 'pending' GROUP BY chat_id")
         master_log_id = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
@@ -997,52 +1025,53 @@ async def admin_global_process_stats(callback: CallbackQuery):
             active_broadcast_count += 1
             info = live_broadcast_stats[qid]
             eta_str = format_eta(info["eta_seconds"])
+            scope_str = info.get("scope", "BOTH")
             report.append(
-                f"• <b>{info['name']}</b>\n"
-                f"  ├ Already Sent: <code>{info['sent']} / {info['total']}</code> posts\n"
+                f"• <b>{info['name']}</b> [{scope_str}]\n"
+                f"  ├ Progress: <code>{info['sent']} / {info['total']}</code> posts\n"
                 f"  ├ Destinations: <code>{info['destination']}</code>\n"
-                f"  ├ Order: <code>{info['mode'].upper()}</code>\n"
-                f"  └ ⏳ <b>Estimated Time Required:</b> <code>{eta_str}</code>\n"
+                f"  └ ⏳ <b>ETA:</b> <code>{eta_str}</code>\n"
             )
 
     if active_broadcast_count == 0:
         report.append("<i>No broadcast queues are currently running.</i>\n")
 
-    report.append("🤝 <b>Join Request & Unmatured Channels:</b>")
-    dest_join_count = 0
-
-    for d in destinations:
-        cid = d["chat_id"]
-        title = d["title"] or cid
-        is_unmatured = d["is_unmatured"]
-        accepting = d["accept_requests"]
-        pending = join_pending_map.get(cid, 0)
-        accepted = d["total_accepted"] or 0
-        total_requests = accepted + pending
-
-        min_d = d["join_delay_min"] or 3
-        max_d = d["join_delay_max"] or 10
-
-        if is_unmatured or accepting or total_requests > 0:
-            dest_join_count += 1
-            accept_tag = "🟢 Accepting" if accepting else "⚪ Paused"
-            avg_delay = (min_d + max_d) / 2
-            eta_val = pending * avg_delay if accepting else 0
-            eta_str = format_eta(eta_val) if accepting and pending > 0 else "Paused / None"
-
-            type_label = "Unmatured" if is_unmatured else "Broadcast"
+    report.append("🟢 <b>Matured Channels (Auto-Accepting Joins):</b>")
+    matured_dests = [d for d in destinations if not d["is_unmatured"]]
+    if matured_dests:
+        for d in matured_dests:
+            cid = d["chat_id"]
+            title = d["title"] or cid
+            pending = join_pending_map.get(cid, 0)
+            accepted = d["total_accepted"] or 0
+            delivered = d["posts_delivered"] or 0
             report.append(
-                f"• <b>{title}</b> ({type_label})\n"
-                f"  ├ Status: {accept_tag}\n"
-                f"  ├ Requests: Done <code>{accepted}</code> out of <code>{total_requests}</code> (Pending: <code>{pending}</code>)\n"
-                f"  ├ Delay: <code>{min_d}s - {max_d}s</code>\n"
-                f"  └ ⏳ <b>Estimated Time Required:</b> <code>{eta_str}</code>\n"
+                f"• <b>{title}</b> (<code>{cid}</code>)\n"
+                f"  ├ Posts Delivered: <code>{delivered}</code> | Approved Joins: <code>{accepted}</code>\n"
+                f"  └ Pending Joins: <code>{pending}</code> (Processing with {d['join_delay_min']}s-{d['join_delay_max']}s delay)\n"
             )
+    else:
+        report.append("<i>No Matured channels configured.</i>\n")
 
-    if dest_join_count == 0:
-        report.append("<i>No active join request pipelines configured.</i>\n")
+    report.append("⚪ <b>Unmatured Channels:</b>")
+    unmatured_dests = [d for d in destinations if d["is_unmatured"]]
+    if unmatured_dests:
+        for d in unmatured_dests:
+            cid = d["chat_id"]
+            title = d["title"] or cid
+            accepting = d["accept_requests"]
+            pending = join_pending_map.get(cid, 0)
+            accepted = d["total_accepted"] or 0
+            status_badge = "🟢 Accepting Joins" if accepting else "⚪ Paused"
+            report.append(
+                f"• <b>{title}</b> — {status_badge}\n"
+                f"  ├ Requests: <code>{accepted}</code> approved, <code>{pending}</code> pending\n"
+                f"  └ Interval: <code>{d['join_delay_min']}s - {d['join_delay_max']}s</code>\n"
+            )
+    else:
+        report.append("<i>No Unmatured channels configured.</i>\n")
 
-    report.append("📁 <b>Queue Inventory & Performance:</b>")
+    report.append("📁 <b>Queue Inventory:</b>")
     if all_queues:
         for q in all_queues:
             qid = q["id"]
@@ -1050,32 +1079,10 @@ async def admin_global_process_stats(callback: CallbackQuery):
             curr_posts = posts_map.get(qid, 0)
             runs = q["run_count"] or 0
             report.append(
-                f"• <b>{qname}</b> (ID: <code>{qid}</code>)\n"
-                f"  ├ Saved Posts in DB: <code>{curr_posts}</code>\n"
-                f"  └ Lifetime Execution: <code>{runs}</code> time(s) run\n"
+                f"• <b>{qname}</b>: <code>{curr_posts}</code> stored posts | <code>{runs}</code> runs"
             )
     else:
-        report.append("<i>No queues created yet.</i>\n")
-
-    report.append("📡 <b>Destination Health & Delivery:</b>")
-    if destinations:
-        for d in destinations:
-            cid = d["chat_id"]
-            title = d["title"] or cid
-            delivered = d["posts_delivered"] or 0
-            is_master = (cid == master_log_id)
-            roles = []
-            if is_master:
-                roles.append("Master Log")
-            if d["is_unmatured"]:
-                roles.append("Unmatured")
-            else:
-                roles.append("Broadcast")
-
-            role_tag = ", ".join(roles)
-            report.append(f"• <b>{title}</b> [{role_tag}]: <code>{delivered}</code> posts posted")
-    else:
-        report.append("<i>No destinations connected.</i>")
+        report.append("<i>No queues created yet.</i>")
 
     buttons = [
         [InlineKeyboardButton(text="🔄 Refresh Live Stats", callback_data="admin_global_process_stats")],
@@ -1093,18 +1100,23 @@ async def render_run_hub_detail(callback: CallbackQuery, queue_id: int):
     async with pool.acquire() as conn:
         q = await conn.fetchrow("SELECT * FROM queues WHERE id = $1", queue_id)
         post_count = await conn.fetchval("SELECT COUNT(*) FROM posts WHERE queue_id = $1", queue_id)
-        dest_title = None
-        if q and q["destination"]:
-            d = await conn.fetchrow("SELECT title FROM destinations WHERE chat_id = $1", q["destination"])
-            dest_title = d["title"] if d else q["destination"]
+        
+        # Count bound destinations by type
+        m_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM destinations WHERE (assigned_queue_id = $1 OR chat_id = $2) AND is_unmatured = FALSE",
+            queue_id, q["destination"] if q else None
+        ) or 0
+        u_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM destinations WHERE (assigned_queue_id = $1 OR chat_id = $2) AND is_unmatured = TRUE",
+            queue_id, q["destination"] if q else None
+        ) or 0
 
     if not q:
         await callback.answer("Queue not found.", show_alert=True)
         return
 
     is_running = queue_id in active_tasks and not active_tasks[queue_id].done()
-    status_str = "🟢 Active (Sending)" if is_running else "⚪ Idle (Ready)"
-    dest_str = dest_title or "⚠️ Not configured"
+    status_str = "🟢 Active (Broadcasting)" if is_running else "⚪ Idle (Ready)"
     mode = q["mode"] or "sequence"
     delay_type = q["delay_type"] or "fixed"
 
@@ -1121,12 +1133,12 @@ async def render_run_hub_detail(callback: CallbackQuery, queue_id: int):
             InlineKeyboardButton(text=f"⏱ {delay_str}", callback_data=f"open_delay_menu:{queue_id}")
         ],
         [
-            InlineKeyboardButton(text="🎯 Set/Change Target Destination", callback_data=f"q_pick_dest:{queue_id}")
+            InlineKeyboardButton(text="🎯 Bind / Change Destination", callback_data=f"q_pick_dest:{queue_id}")
         ],
         [
             InlineKeyboardButton(
                 text="▶️ Start Sending Queue" if not is_running else "⏹ Halt Running Queue",
-                callback_data=f"toggle_run_hub:{queue_id}"
+                callback_data=f"prompt_run_scope:{queue_id}" if not is_running else f"toggle_run_hub:{queue_id}:stop"
             )
         ],
         [InlineKeyboardButton(text="🔙 Back to Running Hub", callback_data="admin_running_queues")]
@@ -1136,11 +1148,12 @@ async def render_run_hub_detail(callback: CallbackQuery, queue_id: int):
         f"🚀 <b>Queue Scheduler:</b> <code>{q['name']}</code>\n\n"
         f"• <b>Status:</b> {status_str}\n"
         f"• <b>Stored Posts:</b> <code>{post_count}</code>\n"
-        f"• <b>Destination Channel:</b> <b>{dest_str}</b>\n"
+        f"• <b>Assigned Matured Channels:</b> <code>{m_count}</code>\n"
+        f"• <b>Assigned Unmatured Channels:</b> <code>{u_count}</code>\n"
         f"• <b>Playback Order:</b> <code>{mode.capitalize()}</code>\n"
-        f"• <b>Delay Type:</b> <code>{delay_str}</code>\n"
-        f"• <b>Lifetime Runs:</b> <code>{q['run_count']}</code>\n\n"
-        "Configure settings above and tap <b>Start Sending Queue</b>."
+        f"• <b>Delay Profile:</b> <code>{delay_str}</code>\n"
+        f"• <b>Lifetime Launches:</b> <code>{q['run_count']}</code>\n\n"
+        "Configure delay/order above and tap <b>Start Sending Queue</b>."
     )
     await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, detail_card, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
@@ -1199,37 +1212,72 @@ async def admin_set_mode_hub(callback: CallbackQuery):
     await render_run_hub_detail(callback, queue_id)
 
 
-@router.callback_query(F.data.startswith("toggle_run_hub:"))
-async def admin_toggle_run_hub(callback: CallbackQuery, bot: Bot):
+# ==================== PROMPT BROADCAST DESTINATION SCOPE ====================
+
+@router.callback_query(F.data.startswith("prompt_run_scope:"))
+async def admin_prompt_run_scope(callback: CallbackQuery):
     await callback.answer()
     if callback.from_user.id != get_admin_id():
         return
     queue_id = int(callback.data.split(":")[1])
 
-    if queue_id in active_tasks and not active_tasks[queue_id].done():
-        active_tasks[queue_id].cancel()
-        del active_tasks[queue_id]
-        live_broadcast_stats.pop(queue_id, None)
-        await callback.answer("Broadcast stopped.", show_alert=True)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        q = await conn.fetchrow("SELECT name, destination FROM queues WHERE id = $1", queue_id)
+        post_count = await conn.fetchval("SELECT COUNT(*) FROM posts WHERE queue_id = $1", queue_id)
+        m_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM destinations WHERE (assigned_queue_id = $1 OR chat_id = $2) AND is_unmatured = FALSE",
+            queue_id, q["destination"] if q else None
+        ) or 0
+        u_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM destinations WHERE (assigned_queue_id = $1 OR chat_id = $2) AND is_unmatured = TRUE",
+            queue_id, q["destination"] if q else None
+        ) or 0
+
+    if post_count == 0:
+        await callback.answer("⚠️ Queue is empty! No posts to broadcast.", show_alert=True)
+        return
+    if (m_count + u_count) == 0:
+        await callback.answer("⚠️ No destinations assigned to this queue!", show_alert=True)
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=f"🟢 Matured Channels Only ({m_count})", callback_data=f"toggle_run_hub:{queue_id}:matured")],
+        [InlineKeyboardButton(text=f"⚪ Unmatured Channels Only ({u_count})", callback_data=f"toggle_run_hub:{queue_id}:unmatured")],
+        [InlineKeyboardButton(text=f"🌐 Both Matured & Unmatured ({m_count + u_count})", callback_data=f"toggle_run_hub:{queue_id}:both")],
+        [InlineKeyboardButton(text="🔙 Cancel", callback_data=f"run_hub_q:{queue_id}")]
+    ]
+
+    prompt_text = (
+        f"🚀 <b>Select Broadcast Targets for {q['name']}:</b>\n\n"
+        "Where should this broadcast run?\n\n"
+        f"• <b>Matured Channels:</b> <code>{m_count}</code> connected\n"
+        f"• <b>Unmatured Channels:</b> <code>{u_count}</code> connected\n\n"
+        "Tap your preferred destination scope below:"
+    )
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, prompt_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("toggle_run_hub:"))
+async def admin_toggle_run_hub(callback: CallbackQuery, bot: Bot):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    parts = callback.data.split(":")
+    queue_id = int(parts[1])
+    action_or_scope = parts[2] if len(parts) > 2 else "both"
+
+    if action_or_scope == "stop":
+        if queue_id in active_tasks and not active_tasks[queue_id].done():
+            active_tasks[queue_id].cancel()
+            del active_tasks[queue_id]
+            live_broadcast_stats.pop(queue_id, None)
+            await callback.answer("Broadcast stopped.", show_alert=True)
     else:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            q = await conn.fetchrow("SELECT destination FROM queues WHERE id = $1", queue_id)
-            unmatured_exists = await conn.fetchval(
-                "SELECT 1 FROM destinations WHERE assigned_queue_id = $1 LIMIT 1", queue_id
-            )
-            post_count = await conn.fetchval("SELECT COUNT(*) FROM posts WHERE queue_id = $1", queue_id)
-
-        if not q or (not q["destination"] and not unmatured_exists):
-            await callback.answer("⚠️ No broadcast destination attached!", show_alert=True)
-            return
-        if post_count == 0:
-            await callback.answer("⚠️ Queue is empty! No posts to send.", show_alert=True)
-            return
-
-        task = asyncio.create_task(broadcast_worker(bot, queue_id))
+        # action_or_scope is 'matured', 'unmatured', or 'both'
+        task = asyncio.create_task(broadcast_worker(bot, queue_id, target_scope=action_or_scope))
         active_tasks[queue_id] = task
-        await callback.answer("🚀 Broadcast launched!", show_alert=True)
+        await callback.answer(f"🚀 Broadcast started ({action_or_scope.upper()})!", show_alert=True)
 
     await render_run_hub_detail(callback, queue_id)
 
@@ -1243,43 +1291,29 @@ async def admin_q_pick_dest(callback: CallbackQuery):
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        destinations = await conn.fetch("SELECT chat_id, title FROM destinations ORDER BY title ASC")
+        destinations = await conn.fetch("SELECT chat_id, title, is_unmatured FROM destinations ORDER BY is_unmatured ASC, title ASC")
 
     if not destinations:
         await callback.answer("No destinations found. Add one with /addest first!", show_alert=True)
         return
 
-    buttons = [
-        [InlineKeyboardButton(text=f"📡 {d['title'] or d['chat_id']}", callback_data=f"q_apply_dest:{queue_id}:{d['chat_id']}")]
-        for d in destinations
-    ]
-    buttons.append([InlineKeyboardButton(text="❌ Detach Destination", callback_data=f"q_apply_dest:{queue_id}:none")])
-    buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data=f"run_hub_q:{queue_id}")])
+    buttons = []
+    for d in destinations:
+        type_prefix = "⚪" if d["is_unmatured"] else "🟢"
+        buttons.append([InlineKeyboardButton(
+            text=f"{type_prefix} {d['title'] or d['chat_id']}",
+            callback_data=f"dest_apply_queue:{d['chat_id']}:{queue_id}"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="🔙 Back to Queue", callback_data=f"run_hub_q:{queue_id}")])
 
     await safe_edit_message(
         callback.message.bot,
         callback.message.chat.id,
         callback.message.message_id,
-        "🎯 <b>Select Destination for Broadcast:</b>",
+        "🎯 <b>Assign Destination Channel to This Queue:</b>\n\nTap any destination below to link it:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
-
-
-@router.callback_query(F.data.startswith("q_apply_dest:"))
-async def admin_q_apply_dest(callback: CallbackQuery):
-    await callback.answer("Destination updated!")
-    if callback.from_user.id != get_admin_id():
-        return
-    parts = callback.data.split(":")
-    queue_id = int(parts[1])
-    dest_id = parts[2]
-    dest_val = None if dest_id == "none" else dest_id
-
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE queues SET destination = $1 WHERE id = $2", dest_val, queue_id)
-
-    await render_run_hub_detail(callback, queue_id)
 
 
 # ==================== DELAY CONFIGURATION ====================
@@ -1380,7 +1414,7 @@ async def admin_set_random_save(message: Message, state: FSMContext):
     await message.answer(f"✅ Random delay range set to <code>{min_d}s - {max_d}s</code>.", parse_mode="HTML", reply_markup=kb)
 
 
-# ==================== DESTINATIONS DASHBOARD ====================
+# ==================== SEPARATED AVAILABLE DESTINATIONS DASHBOARD ====================
 
 @router.callback_query(F.data == "admin_view_destinations")
 async def admin_view_destinations(callback: CallbackQuery):
@@ -1390,42 +1424,74 @@ async def admin_view_destinations(callback: CallbackQuery):
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        destinations = await conn.fetch("SELECT * FROM destinations ORDER BY title ASC")
-        queues = await conn.fetch("SELECT id, name, destination FROM queues")
-        master_log = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
+        matured_count = await conn.fetchval("SELECT COUNT(*) FROM destinations WHERE is_unmatured = FALSE") or 0
+        unmatured_count = await conn.fetchval("SELECT COUNT(*) FROM destinations WHERE is_unmatured = TRUE") or 0
 
-    total_count = len(destinations)
-    buttons = []
     text = (
-        f"📡 <b>Connected Destinations ({total_count} Active):</b>\n\n"
-        "💡 <b>Quick Add:</b> Send <code>/addest NickName numerical_id</code> to register immediately.\n\n"
+        "📡 <b>Available Destinations Hub</b>\n\n"
+        "Destinations are categorized into strictly one of two channels:\n\n"
+        f"• 🟢 <b>Matured Channels ({matured_count}):</b>\n"
+        "  Target broadcast channels where join requests are <b>automatically approved</b> with a safe random delay.\n\n"
+        f"• ⚪ <b>Unmatured Channels ({unmatured_count}):</b>\n"
+        "  Channels where membership growth is active. Join requests remain <b>paused by default</b> until you activate them.\n\n"
+        "💡 <i>Tip: Add destinations anytime via <code>/addest Name numerical_id</code></i>"
     )
 
+    buttons = [
+        [InlineKeyboardButton(text=f"🟢 Matured Channels ({matured_count})", callback_data="admin_dest_list:matured")],
+        [InlineKeyboardButton(text=f"⚪ Unmatured Channels ({unmatured_count})", callback_data="admin_dest_list:unmatured")],
+        [InlineKeyboardButton(text="🔙 Back to Admin Menu", callback_data="admin_back")]
+    ]
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("admin_dest_list:"))
+async def admin_dest_list_category(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    category = callback.data.split(":")[1]
+    is_unm = (category == "unmatured")
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        destinations = await conn.fetch(
+            "SELECT * FROM destinations WHERE is_unmatured = $1 ORDER BY title ASC", is_unm
+        )
+        queues_map = {row["id"]: row["name"] for row in await conn.fetch("SELECT id, name FROM queues")}
+        master_log = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
+
+    cat_label = "⚪ Unmatured Channels" if is_unm else "🟢 Matured Channels"
+    text = f"📡 <b>{cat_label} ({len(destinations)} Total):</b>\n\n"
+
+    if not destinations:
+        text += f"<i>No {category} destinations added yet. Use /addest to register.</i>"
+        buttons = [[InlineKeyboardButton(text="🔙 Back to Available Destinations", callback_data="admin_view_destinations")]]
+        await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        return
+
+    buttons = []
     for d in destinations:
         cid = d["chat_id"]
-        title = d["title"]
-        ctype = d["chat_type"]
-        is_unmatured = d["is_unmatured"]
-        accept_requests = d["accept_requests"]
-
-        assigned_targets = [q["name"] for q in queues if q["destination"] == cid]
+        title = d["title"] or cid
+        qname = queues_map.get(d["assigned_queue_id"], "None")
         is_master = (cid == master_log)
-
-        status_tags = []
+        
+        status_info = []
         if is_master:
-            status_tags.append("MASTER LOG")
-        if is_unmatured:
-            status_tags.append("UNMATURED")
-        if assigned_targets:
-            status_tags.append(f"Target: {', '.join(assigned_targets)}")
-        if accept_requests:
-            status_tags.append("Accepting Joins 🟢")
+            status_info.append("MASTER LOG")
+        if qname != "None":
+            status_info.append(f"Queue: {qname}")
+        if is_unm:
+            status_info.append("Accepting 🟢" if d["accept_requests"] else "Paused ⚪")
+        else:
+            status_info.append("Auto-Accept 🟢")
 
-        status_str = f" — [{', '.join(status_tags)}]" if status_tags else " — [Unassigned]"
-        text += f"• <b>{title}</b> ({ctype.capitalize()})\n  ID: <code>{cid}</code>{status_str}\n\n"
+        meta_str = f" [{', '.join(status_info)}]" if status_info else ""
+        text += f"• <b>{title}</b> (<code>{cid}</code>){meta_str}\n"
         buttons.append([InlineKeyboardButton(text=f"⚙️ Manage: {title}", callback_data=f"dest_actions:{cid}")])
 
-    buttons.append([InlineKeyboardButton(text="🔙 Back to Admin Panel", callback_data="admin_back")])
+    buttons.append([InlineKeyboardButton(text="🔙 Back to Available Destinations", callback_data="admin_view_destinations")])
     await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
@@ -1439,10 +1505,10 @@ async def render_dest_actions(callback: CallbackQuery, chat_id: str):
             assigned_qname = q_row["name"] if q_row else None
         pending_joins = await conn.fetchval(
             "SELECT COUNT(*) FROM join_requests WHERE chat_id = $1 AND status = 'pending'", chat_id
-        )
+        ) or 0
         total_joins = await conn.fetchval(
             "SELECT COUNT(*) FROM join_requests WHERE chat_id = $1", chat_id
-        )
+        ) or 0
 
     if not dest:
         await callback.answer("Destination not found.", show_alert=True)
@@ -1453,35 +1519,39 @@ async def render_dest_actions(callback: CallbackQuery, chat_id: str):
     accept_requests = dest["accept_requests"]
     join_min = dest["join_delay_min"] or 3
     join_max = dest["join_delay_max"] or 10
-    total_acc = dest["total_accepted"] or 0
     delivered = dest["posts_delivered"] or 0
 
-    buttons = [
-        [InlineKeyboardButton(text="🎯 Set as Broadcast Destination", callback_data=f"dest_assign_broadcast:{chat_id}")],
-        [InlineKeyboardButton(text="📋 Set as Master Log Destination", callback_data=f"dest_set_master:{chat_id}")],
-        [InlineKeyboardButton(text="⚪ Set as Unmatured Destination", callback_data=f"dest_set_unmatured:{chat_id}")]
-    ]
+    buttons = []
 
-    join_status_label = "⏹ Stop Accepting Requests" if accept_requests else "▶️ Start Accepting Requests"
-    buttons.append([InlineKeyboardButton(text=join_status_label, callback_data=f"dest_toggle_accept:{chat_id}")])
-    buttons.append([InlineKeyboardButton(text=f"⏱ Join Delay: {join_min}s - {join_max}s", callback_data=f"dest_prompt_join_delay:{chat_id}")])
+    # Assign / change queue
+    q_label = f"📁 Broadcast Queue: {assigned_qname or 'None'}"
+    buttons.append([InlineKeyboardButton(text=q_label, callback_data=f"dest_pick_queue:{chat_id}")])
 
+    # Category conversion: Strict mutual exclusivity
     if is_unmatured:
-        q_label = f"📁 Broadcast Queue: {assigned_qname or 'None'}"
-        buttons.append([InlineKeyboardButton(text=q_label, callback_data=f"unmatured_bind_q:{chat_id}")])
-        buttons.append([InlineKeyboardButton(text="🔄 Convert to Broadcast Destination", callback_data=f"unmatured_convert_broadcast:{chat_id}")])
+        buttons.append([InlineKeyboardButton(text="🟢 Convert to Matured Channel", callback_data=f"dest_convert_matured:{chat_id}")])
+        join_btn_text = "⏹ Pause Accepting Requests" if accept_requests else "▶️ Start Accepting Join Requests"
+        buttons.append([InlineKeyboardButton(text=join_btn_text, callback_data=f"dest_toggle_accept:{chat_id}")])
+    else:
+        buttons.append([InlineKeyboardButton(text="⚪ Convert to Unmatured Channel", callback_data=f"dest_convert_unmatured:{chat_id}")])
 
-    buttons.append([InlineKeyboardButton(text="🔙 Back to Destinations", callback_data="admin_view_destinations")])
+    buttons.append([InlineKeyboardButton(text=f"⏱ Join Delay: {join_min}s - {join_max}s", callback_data=f"dest_prompt_join_delay:{chat_id}")])
+    buttons.append([InlineKeyboardButton(text="📋 Set as Master Log", callback_data=f"dest_set_master:{chat_id}")])
+    
+    back_target = "unmatured" if is_unmatured else "matured"
+    buttons.append([InlineKeyboardButton(text="🔙 Back to Channels", callback_data=f"admin_dest_list:{back_target}")])
 
-    status_tag = "Unmatured" if is_unmatured else "Regular Broadcast"
+    cat_label = "⚪ Unmatured Channel" if is_unmatured else "🟢 Matured Channel"
+    join_flow_status = "🟢 Auto-Accepted (Running)" if not is_unmatured else ("🟢 Accepting Requests" if accept_requests else "⚪ Paused")
+
     card = (
         f"⚙️ <b>Destination:</b> <b>{title}</b> (<code>{chat_id}</code>)\n\n"
-        f"• <b>Status:</b> <code>{status_tag}</code>\n"
-        f"• <b>Posts Delivered (Health):</b> <code>{delivered}</code>\n"
-        f"• <b>Join Requests Auto-Accept:</b> {'🟢 Running' if accept_requests else '⚪ Paused'}\n"
-        f"• <b>Requests:</b> <code>{total_joins - pending_joins} / {total_joins}</code> approved (<b>{pending_joins} pending</b>)\n"
+        f"• <b>Channel Category:</b> <code>{cat_label}</code>\n"
+        f"• <b>Assigned Queue:</b> <code>{assigned_qname or 'None'}</code>\n"
+        f"• <b>Posts Delivered:</b> <code>{delivered}</code>\n"
+        f"• <b>Join Requests Mode:</b> <code>{join_flow_status}</code>\n"
+        f"• <b>Requests History:</b> <code>{total_joins - pending_joins} / {total_joins}</code> approved (<b>{pending_joins} pending</b>)\n"
         f"• <b>Random Join Delay:</b> <code>{join_min}s - {join_max}s</code>\n"
-        + (f"• <b>Assigned Broadcast Queue:</b> <code>{assigned_qname or 'None'}</code>\n" if is_unmatured else "")
     )
     await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, card, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
@@ -1494,6 +1564,64 @@ async def admin_dest_actions(callback: CallbackQuery):
     chat_id = callback.data.split(":")[1]
     await render_dest_actions(callback, chat_id)
 
+
+# ==================== CONVERSION: MATURED <-> UNMATURED ====================
+
+@router.callback_query(F.data.startswith("dest_convert_matured:"))
+async def admin_dest_convert_matured(callback: CallbackQuery, bot: Bot):
+    await callback.answer("Converted to Matured Channel!")
+    if callback.from_user.id != get_admin_id():
+        return
+    chat_id = callback.data.split(":")[1]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Matured channel automatically has accept_requests enabled
+        await conn.execute(
+            """
+            UPDATE destinations 
+            SET is_unmatured = FALSE, accept_requests = TRUE 
+            WHERE chat_id = $1
+            """,
+            chat_id
+        )
+
+    # Trigger join worker immediately for any pending join requests
+    if chat_id not in active_join_tasks or active_join_tasks[chat_id].done():
+        task = asyncio.create_task(join_request_worker(bot, chat_id))
+        active_join_tasks[chat_id] = task
+
+    await render_dest_actions(callback, chat_id)
+
+
+@router.callback_query(F.data.startswith("dest_convert_unmatured:"))
+async def admin_dest_convert_unmatured(callback: CallbackQuery):
+    await callback.answer("Converted to Unmatured Channel!")
+    if callback.from_user.id != get_admin_id():
+        return
+    chat_id = callback.data.split(":")[1]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Unmatured channels default to paused join requests until admin activates
+        await conn.execute(
+            """
+            UPDATE destinations 
+            SET is_unmatured = TRUE, accept_requests = FALSE 
+            WHERE chat_id = $1
+            """,
+            chat_id
+        )
+
+    # Pause active join task if any
+    if chat_id in active_join_tasks:
+        active_join_tasks[chat_id].cancel()
+        del active_join_tasks[chat_id]
+
+    await render_dest_actions(callback, chat_id)
+
+
+# ==================== JOIN REQUESTS TOGGLE & INTERVAL ====================
 
 @router.callback_query(F.data.startswith("dest_toggle_accept:"))
 async def admin_dest_toggle_accept(callback: CallbackQuery, bot: Bot):
@@ -1565,8 +1693,10 @@ async def admin_dest_save_join_delay(message: Message, state: FSMContext):
     await message.answer(f"✅ Random join delay set to <code>{min_d}s - {max_d}s</code>.", parse_mode="HTML", reply_markup=kb)
 
 
-@router.callback_query(F.data.startswith("unmatured_bind_q:"))
-async def admin_unmatured_bind_q(callback: CallbackQuery):
+# ==================== ASSIGN QUEUE TO DESTINATION ====================
+
+@router.callback_query(F.data.startswith("dest_pick_queue:"))
+async def admin_dest_pick_queue(callback: CallbackQuery):
     await callback.answer()
     if callback.from_user.id != get_admin_id():
         return
@@ -1577,17 +1707,17 @@ async def admin_unmatured_bind_q(callback: CallbackQuery):
         queues = await conn.fetch("SELECT id, name FROM queues ORDER BY id ASC")
 
     buttons = [
-        [InlineKeyboardButton(text=f"📁 Broadcast: {q['name']}", callback_data=f"unmatured_apply_q:{chat_id}:{q['id']}")]
+        [InlineKeyboardButton(text=f"📁 {q['name']}", callback_data=f"dest_apply_queue:{chat_id}:{q['id']}")]
         for q in queues
     ]
-    buttons.append([InlineKeyboardButton(text="❌ Detach Queue", callback_data=f"unmatured_apply_q:{chat_id}:0")])
+    buttons.append([InlineKeyboardButton(text="❌ Detach Queue", callback_data=f"dest_apply_queue:{chat_id}:0")])
     buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data=f"dest_actions:{chat_id}")])
 
-    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "Choose which queue should also broadcast to this Unmatured Destination:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "Select which queue should broadcast to this destination:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
-@router.callback_query(F.data.startswith("unmatured_apply_q:"))
-async def admin_unmatured_apply_q(callback: CallbackQuery):
+@router.callback_query(F.data.startswith("dest_apply_queue:"))
+async def admin_dest_apply_queue(callback: CallbackQuery):
     await callback.answer("Updated broadcast queue")
     if callback.from_user.id != get_admin_id():
         return
@@ -1600,77 +1730,6 @@ async def admin_unmatured_apply_q(callback: CallbackQuery):
             await conn.execute("UPDATE destinations SET assigned_queue_id = NULL WHERE chat_id = $1", chat_id)
         else:
             await conn.execute("UPDATE destinations SET assigned_queue_id = $1 WHERE chat_id = $2", qid, chat_id)
-
-    await render_dest_actions(callback, chat_id)
-
-
-@router.callback_query(F.data.startswith("unmatured_convert_broadcast:"))
-async def admin_unmatured_convert_broadcast(callback: CallbackQuery, bot: Bot):
-    await callback.answer("Converting destination...")
-    if callback.from_user.id != get_admin_id():
-        return
-    chat_id = callback.data.split(":")[1]
-
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        dest = await conn.fetchrow("SELECT title, assigned_queue_id FROM destinations WHERE chat_id = $1", chat_id)
-        await conn.execute(
-            """
-            UPDATE destinations 
-            SET is_unmatured = FALSE, accept_requests = TRUE, join_delay_min = 3, join_delay_max = 8 
-            WHERE chat_id = $1
-            """,
-            chat_id
-        )
-
-        if dest and dest["assigned_queue_id"]:
-            await conn.execute(
-                "UPDATE queues SET destination = $1 WHERE id = $2", chat_id, dest["assigned_queue_id"]
-            )
-
-    if chat_id not in active_join_tasks or active_join_tasks[chat_id].done():
-        task = asyncio.create_task(join_request_worker(bot, chat_id))
-        active_join_tasks[chat_id] = task
-
-    await render_dest_actions(callback, chat_id)
-
-
-@router.callback_query(F.data.startswith("dest_assign_broadcast:"))
-async def admin_dest_assign_broadcast(callback: CallbackQuery):
-    await callback.answer()
-    if callback.from_user.id != get_admin_id():
-        return
-    chat_id = callback.data.split(":")[1]
-
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        queues = await conn.fetch("SELECT id, name FROM queues ORDER BY id ASC")
-
-    if not queues:
-        await callback.answer("⚠️ No queues found. Create a queue first!", show_alert=True)
-        return
-
-    buttons = [
-        [InlineKeyboardButton(text=f"📁 Assign to: {q['name']}", callback_data=f"confirm_broadcast_bind:{chat_id}:{q['id']}")]
-        for q in queues
-    ]
-    buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data=f"dest_actions:{chat_id}")])
-
-    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "Select which queue will broadcast to this destination:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-
-@router.callback_query(F.data.startswith("confirm_broadcast_bind:"))
-async def admin_confirm_broadcast_bind(callback: CallbackQuery):
-    await callback.answer("Bound!")
-    if callback.from_user.id != get_admin_id():
-        return
-    _, chat_id, qid_str = callback.data.split(":")
-    queue_id = int(qid_str)
-
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE queues SET destination = $1 WHERE id = $2", chat_id, queue_id)
-        await conn.execute("UPDATE destinations SET is_unmatured = FALSE WHERE chat_id = $1", chat_id)
 
     await render_dest_actions(callback, chat_id)
 
@@ -1694,22 +1753,6 @@ async def admin_dest_set_master(callback: CallbackQuery, bot: Bot):
         )
 
     await dispatch_notification(bot, "📋 <b>Channel Assigned as Master Log Destination</b>")
-    await render_dest_actions(callback, chat_id)
-
-
-@router.callback_query(F.data.startswith("dest_set_unmatured:"))
-async def admin_dest_set_unmatured(callback: CallbackQuery):
-    await callback.answer("Marked unmatured")
-    if callback.from_user.id != get_admin_id():
-        return
-    chat_id = callback.data.split(":")[1]
-
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE queues SET destination = NULL WHERE destination = $1", chat_id)
-        await conn.execute("DELETE FROM bot_settings WHERE key = 'master_log_chat_id' AND value = $1", chat_id)
-        await conn.execute("UPDATE destinations SET is_unmatured = TRUE WHERE chat_id = $1", chat_id)
-
     await render_dest_actions(callback, chat_id)
 
 
@@ -1754,9 +1797,8 @@ async def admin_create_queue_save(message: Message, state: FSMContext, bot: Bot)
             confirmation_card = (
                 "✅ <b>Queue Created Successfully!</b>\n\n"
                 f"• <b>Queue Name:</b> <code>{queue_name}</code>\n"
-                f"• <b>Queue ID:</b> <code>{new_id}</code>\n"
-                f"• <b>Destination:</b> <i>Not configured</i>\n\n"
-                "Tap below to schedule it in the Running Hub or assign a destination."
+                f"• <b>Queue ID:</b> <code>{new_id}</code>\n\n"
+                "Tap below to schedule it in the Running Hub or assign destinations."
             )
             await message.answer(confirmation_card, parse_mode="HTML", reply_markup=confirm_kb)
 
@@ -1768,28 +1810,6 @@ async def admin_create_queue_save(message: Message, state: FSMContext, bot: Bot)
                 reply_markup=kb
             )
             await state.clear()
-
-
-@router.message(AdminStates.waiting_for_destination_manual, F.text)
-async def admin_set_dest_manual_save(message: Message, state: FSMContext, bot: Bot):
-    if message.from_user.id != get_admin_id():
-        return
-    data = await state.get_data()
-    queue_id = data["current_queue_id"]
-    dest = message.text.strip()
-
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE queues SET destination = $1 WHERE id = $2", dest, queue_id)
-
-    await dispatch_notification(
-        bot,
-        f"⚙️ <b>Queue Destination Updated:</b> Broadcast target set to <code>{dest}</code>",
-        queue_id=queue_id
-    )
-    await state.clear()
-    kb = await get_admin_main_kb()
-    await message.answer(f"✅ Target destination set to <code>{dest}</code>.", parse_mode="HTML", reply_markup=kb)
 
 
 @router.message(AdminStates.waiting_for_master_log_manual, F.text)
@@ -2378,7 +2398,6 @@ async def admin_queue_detail(callback: CallbackQuery):
         return
 
     name = q["name"]
-    dest_str = q["destination"] or "Not configured"
     is_running = queue_id in active_tasks and not active_tasks[queue_id].done()
     status_str = "🟢 Active (Broadcasting)" if is_running else "⚪ Idle"
 
@@ -2395,7 +2414,6 @@ async def admin_queue_detail(callback: CallbackQuery):
         f"📁 <b>Queue:</b> <code>{name}</code>\n\n"
         f"• <b>Status:</b> {status_str}\n"
         f"• <b>Total Stored Posts:</b> <code>{post_count}</code>\n"
-        f"• <b>Broadcast Target:</b> <code>{dest_str}</code>\n"
         f"• <b>Lifetime Launches:</b> <code>{q['run_count']}</code> time(s)\n"
     )
     await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
