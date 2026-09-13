@@ -1,4 +1,5 @@
 import os
+import re
 import random
 import asyncio
 import hashlib
@@ -59,9 +60,10 @@ ADMIN_ID = get_admin_id()
 db_pool: Optional[asyncpg.Pool] = None
 _db_initialized: bool = False
 
-# Active queue playback & join-accept tasks
+# Active queue playback, join-accept & ad broadcast tasks
 active_tasks: dict[int, asyncio.Task] = {}
 active_join_tasks: dict[str, asyncio.Task] = {}
+active_ad_task: Optional[asyncio.Task] = None
 
 # Live broadcast progress tracking for stats
 live_broadcast_stats: dict[int, dict] = {}
@@ -102,13 +104,19 @@ async def init_db():
                 delay_max INT DEFAULT 15,
                 delay_type TEXT DEFAULT 'fixed',
                 mode TEXT DEFAULT 'sequence',
-                run_count INT DEFAULT 0
+                run_count INT DEFAULT 0,
+                caption_header TEXT DEFAULT '',
+                caption_footer TEXT DEFAULT '',
+                replace_link_target TEXT DEFAULT ''
             );
         """)
         await conn.execute("ALTER TABLE queues ADD COLUMN IF NOT EXISTS delay_min INT DEFAULT 5;")
         await conn.execute("ALTER TABLE queues ADD COLUMN IF NOT EXISTS delay_max INT DEFAULT 15;")
         await conn.execute("ALTER TABLE queues ADD COLUMN IF NOT EXISTS delay_type TEXT DEFAULT 'fixed';")
         await conn.execute("ALTER TABLE queues ADD COLUMN IF NOT EXISTS run_count INT DEFAULT 0;")
+        await conn.execute("ALTER TABLE queues ADD COLUMN IF NOT EXISTS caption_header TEXT DEFAULT '';")
+        await conn.execute("ALTER TABLE queues ADD COLUMN IF NOT EXISTS caption_footer TEXT DEFAULT '';")
+        await conn.execute("ALTER TABLE queues ADD COLUMN IF NOT EXISTS replace_link_target TEXT DEFAULT '';")
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS uploaders (
@@ -162,12 +170,25 @@ async def init_db():
                 from_chat_id BIGINT,
                 message_id BIGINT,
                 content_hash TEXT,
+                caption TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        await conn.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS caption TEXT;")
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_queue_content_hash ON posts(queue_id, content_hash);
         """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS ad_posts (
+                id SERIAL PRIMARY KEY,
+                from_chat_id BIGINT,
+                message_id BIGINT,
+                content_hash TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_logs (
                 id SERIAL PRIMARY KEY,
@@ -222,6 +243,32 @@ def format_eta(seconds: float) -> str:
     if secs > 0 or len(parts) == 0:
         parts.append(f"{secs} sec")
     return " ".join(parts)
+
+
+def apply_caption_rules(original_text: Optional[str], header: Optional[str], footer: Optional[str], replace_link: Optional[str]) -> Optional[str]:
+    text = original_text or ""
+    header = (header or "").strip()
+    footer = (footer or "").strip()
+    replace_link = (replace_link or "").strip()
+
+    if not text and not header and not footer:
+        return None
+
+    if replace_link and text:
+        # Match t.me/link, telegram.me/link, https://t.me/...
+        tg_link_pattern = r"(https?://)?(www\.)?(t\.me|telegram\.me)/[a-zA-Z0-9_+]+"
+        text = re.sub(tg_link_pattern, replace_link, text)
+
+    parts = []
+    if header:
+        parts.append(header)
+    if text.strip():
+        parts.append(text.strip())
+    if footer:
+        parts.append(footer)
+
+    res = "\n\n".join(parts)
+    return res if res else None
 
 
 async def check_bot_broadcast_permission(bot: Bot, chat_id: str) -> str:
@@ -421,7 +468,7 @@ class UploadBatchSession:
         self.last_sync_time = 0.0
         self.lock = asyncio.Lock()
 
-    async def add_post(self, from_chat_id: int, message_id: int, content_hash: str):
+    async def add_post(self, from_chat_id: int, message_id: int, content_hash: str, caption: Optional[str] = None):
         async with self.lock:
             pool = await get_pool()
             async with pool.acquire() as conn:
@@ -430,14 +477,14 @@ class UploadBatchSession:
                     self.queue_id, content_hash
                 )
 
-            in_memory_dup = any(h == content_hash for _, _, h in self.pending_posts)
+            in_memory_dup = any(h == content_hash for _, _, h, _ in self.pending_posts)
 
             if is_duplicate or in_memory_dup:
                 self.duplicate_count += 1
                 self.pending_dup_logs += 1
             else:
                 self.queued_count += 1
-                self.pending_posts.append((from_chat_id, message_id, content_hash))
+                self.pending_posts.append((from_chat_id, message_id, content_hash, caption))
 
             if self.debounce_task and not self.debounce_task.done():
                 self.debounce_task.cancel()
@@ -453,8 +500,8 @@ class UploadBatchSession:
         async with pool.acquire() as conn:
             if to_insert:
                 await conn.executemany(
-                    "INSERT INTO posts (queue_id, user_id, from_chat_id, message_id, content_hash) VALUES ($1, $2, $3, $4, $5)",
-                    [(self.queue_id, self.user_id, fc, mi, ch) for fc, mi, ch in to_insert]
+                    "INSERT INTO posts (queue_id, user_id, from_chat_id, message_id, content_hash, caption) VALUES ($1, $2, $3, $4, $5, $6)",
+                    [(self.queue_id, self.user_id, fc, mi, ch, cap) for fc, mi, ch, cap in to_insert]
                 )
                 await conn.executemany(
                     "INSERT INTO user_logs (user_id, queue_id, is_duplicate) VALUES ($1, $2, FALSE)",
@@ -559,6 +606,15 @@ class AdminStates(StatesGroup):
     waiting_for_join_delay = State()
     waiting_for_uploader_id = State()
     waiting_for_uploader_name = State()
+    
+    # Ad Management states
+    waiting_for_ad_post = State()
+    waiting_for_ad_delay = State()
+
+    # Caption Editor states
+    waiting_for_caption_header = State()
+    waiting_for_caption_footer = State()
+    waiting_for_caption_link = State()
 
 
 # ==================== AUTO-DISCOVERY & NOTIFICATION WITH ACTION BUTTONS ====================
@@ -586,7 +642,7 @@ async def bot_added_as_admin(event: ChatMemberUpdated, bot: Bot):
         f"• <b>Title:</b> {chat_title}\n"
         f"• <b>ID:</b> <code>{chat_id}</code>\n"
         f"• <b>Type:</b> {chat_type.capitalize()}\n\n"
-        "Select an initial configuration for this destination:"
+        "Select initial configuration for this channel/group:"
     )
 
     setup_kb = InlineKeyboardMarkup(
@@ -686,6 +742,7 @@ async def get_admin_main_kb() -> InlineKeyboardMarkup:
     async with pool.acquire() as conn:
         matured_count = await conn.fetchval("SELECT COUNT(*) FROM destinations WHERE is_unmatured = FALSE") or 0
         unmatured_count = await conn.fetchval("SELECT COUNT(*) FROM destinations WHERE is_unmatured = TRUE") or 0
+        ad_count = await conn.fetchval("SELECT COUNT(*) FROM ad_posts") or 0
         master_log = await conn.fetchval(
             "SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'"
         )
@@ -695,9 +752,11 @@ async def get_admin_main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📂 Manage Queues", callback_data="admin_manage_hub")],
-            [InlineKeyboardButton(text="📈 Matrix", callback_data="admin_matrix_hub")],
-            [InlineKeyboardButton(text="👤 Add Flezen Uploader", callback_data="admin_add_uploader")],
+            [InlineKeyboardButton(text="📢 Advertisement Hub", callback_data="admin_ads_hub")],
+            [InlineKeyboardButton(text="✏️ Edit Queue Captions", callback_data="admin_caption_hub")],
             [InlineKeyboardButton(text=f"📡 Available Destinations (🟢{matured_count} | ⚪{unmatured_count})", callback_data="admin_view_destinations")],
+            [InlineKeyboardButton(text="📈 Matrix & Performance", callback_data="admin_matrix_hub")],
+            [InlineKeyboardButton(text="👤 Add Flezen Uploader", callback_data="admin_add_uploader")],
             [InlineKeyboardButton(text=master_label, callback_data="admin_set_master_log_screen")],
             [InlineKeyboardButton(text="❌ Close Menu", callback_data="admin_close")]
         ]
@@ -877,7 +936,7 @@ async def admin_matrix_joining(callback: CallbackQuery):
     await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "\n".join(report), reply_markup=kb)
 
 
-# ==================== UNIVERSAL BROADCAST WORKER ====================
+# ==================== UNIVERSAL BROADCAST WORKER (WITH CAPTION ENGINE) ====================
 
 async def broadcast_worker(bot: Bot, queue_id: int, target_scope: str = "both"):
     admin_chat_id = get_admin_id()
@@ -891,7 +950,7 @@ async def broadcast_worker(bot: Bot, queue_id: int, target_scope: str = "both"):
         async with pool.acquire() as conn:
             await conn.execute("UPDATE queues SET run_count = run_count + 1 WHERE id = $1", queue_id)
             q = await conn.fetchrow(
-                "SELECT name, delay_sec, delay_min, delay_max, delay_type, mode FROM queues WHERE id = $1",
+                "SELECT name, delay_sec, delay_min, delay_max, delay_type, mode, caption_header, caption_footer, replace_link_target FROM queues WHERE id = $1",
                 queue_id
             )
 
@@ -910,7 +969,7 @@ async def broadcast_worker(bot: Bot, queue_id: int, target_scope: str = "both"):
 
             master_dest = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
             items = await conn.fetch(
-                "SELECT from_chat_id, message_id FROM posts WHERE queue_id = $1 ORDER BY id ASC",
+                "SELECT from_chat_id, message_id, caption FROM posts WHERE queue_id = $1 ORDER BY id ASC",
                 queue_id
             )
 
@@ -929,6 +988,10 @@ async def broadcast_worker(bot: Bot, queue_id: int, target_scope: str = "both"):
         qname = q["name"]
         delay_type = q["delay_type"] or "fixed"
         mode = q["mode"] or "sequence"
+        c_header = q["caption_header"]
+        c_footer = q["caption_footer"]
+        c_link = q["replace_link_target"]
+
         dest_display = f"{len(target_chat_ids)} channel(s) ({', '.join(target_titles[:3])}{'...' if len(target_titles) > 3 else ''})"
 
         items = list(items)
@@ -971,12 +1034,20 @@ async def broadcast_worker(bot: Bot, queue_id: int, target_scope: str = "both"):
 
         sent_count = 0
         for post in items:
+            # Apply dynamic caption modification
+            final_caption = apply_caption_rules(post["caption"], c_header, c_footer, c_link)
+            kwargs = {}
+            if final_caption is not None:
+                kwargs["caption"] = final_caption
+                kwargs["parse_mode"] = "HTML"
+
             for cid in target_chat_ids:
                 try:
                     await bot.copy_message(
                         chat_id=cid,
                         from_chat_id=post["from_chat_id"],
-                        message_id=post["message_id"]
+                        message_id=post["message_id"],
+                        **kwargs
                     )
                     async with pool.acquire() as conn:
                         await conn.execute("UPDATE destinations SET posts_delivered = posts_delivered + 1 WHERE chat_id = $1", cid)
@@ -1040,6 +1111,474 @@ async def broadcast_worker(bot: Bot, queue_id: int, target_scope: str = "both"):
     finally:
         active_tasks.pop(queue_id, None)
         live_broadcast_stats.pop(queue_id, None)
+
+
+# ==================== ADVERTISEMENT BROADCAST WORKER ====================
+
+async def ad_broadcast_worker(bot: Bot, target_scope: str = "both"):
+    global active_ad_task
+    admin_chat_id = get_admin_id()
+    admin_msg_id: Optional[int] = None
+    master_msg_id: Optional[int] = None
+
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            ad_items = await conn.fetch("SELECT from_chat_id, message_id FROM ad_posts ORDER BY id ASC")
+            master_dest = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
+            min_d_val = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'ad_delay_min'")
+            max_d_val = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'ad_delay_max'")
+
+            min_d = int(min_d_val) if min_d_val and min_d_val.isdigit() else 5
+            max_d = int(max_d_val) if max_d_val and max_d_val.isdigit() else 15
+
+            if target_scope == "matured":
+                target_dests = await conn.fetch("SELECT chat_id, title FROM destinations WHERE is_unmatured = FALSE")
+            elif target_scope == "unmatured":
+                target_dests = await conn.fetch("SELECT chat_id, title FROM destinations WHERE is_unmatured = TRUE")
+            else:
+                target_dests = await conn.fetch("SELECT chat_id, title FROM destinations")
+
+        if not ad_items or not target_dests:
+            return
+
+        target_chat_ids = [d["chat_id"] for d in target_dests]
+        total_ads = len(ad_items)
+
+        start_text = (
+            f"📢 <b>Advertisement Broadcast Started</b>\n\n"
+            f"• <b>Scope:</b> <code>{target_scope.upper()}</code>\n"
+            f"• <b>Target Channels:</b> <code>{len(target_chat_ids)}</code>\n"
+            f"• <b>Total Ads:</b> <code>{total_ads}</code>\n"
+            f"• <b>Random Interval:</b> <code>{min_d}s - {max_d}s</code>"
+        )
+        if admin_chat_id:
+            m = await safe_send_message(bot, admin_chat_id, start_text)
+            if m:
+                admin_msg_id = m.message_id
+        if master_dest:
+            m = await safe_send_message(bot, master_dest, start_text)
+            if m:
+                master_msg_id = m.message_id
+
+        sent_count = 0
+        for ad in ad_items:
+            for cid in target_chat_ids:
+                try:
+                    await bot.copy_message(chat_id=cid, from_chat_id=ad["from_chat_id"], message_id=ad["message_id"])
+                except Exception:
+                    pass
+
+            sent_count += 1
+            chosen_delay = random.randint(min(min_d, max_d), max(min_d, max_d))
+
+            if sent_count < total_ads:
+                progress_text = (
+                    f"📢 <b>Broadcasting Ads...</b>\n\n"
+                    f"• <b>Progress:</b> <code>{sent_count} / {total_ads}</code> sent\n"
+                    f"• <b>Scope:</b> {target_scope.upper()} ({len(target_chat_ids)} channels)\n"
+                    f"• <b>Next interval:</b> <code>{chosen_delay}s</code>"
+                )
+                if admin_chat_id and admin_msg_id:
+                    await safe_edit_message(bot, admin_chat_id, admin_msg_id, progress_text)
+                if master_dest and master_msg_id:
+                    await safe_edit_message(bot, master_dest, master_msg_id, progress_text)
+
+                await asyncio.sleep(chosen_delay)
+
+        finish_text = (
+            f"🏁 <b>Advertisement Broadcast Completed!</b>\n\n"
+            f"• <b>Total Ads Sent:</b> <code>{sent_count}</code>\n"
+            f"• <b>Scope Delivered:</b> <code>{target_scope.upper()}</code>"
+        )
+        if admin_chat_id and admin_msg_id:
+            await safe_edit_message(bot, admin_chat_id, admin_msg_id, finish_text)
+        if master_dest and master_msg_id:
+            await safe_edit_message(bot, master_dest, master_msg_id, finish_text)
+
+    except asyncio.CancelledError:
+        pass
+    finally:
+        active_ad_task = None
+
+
+# ==================== ADVERTISEMENT HUB UI ====================
+
+@router.callback_query(F.data == "admin_ads_hub")
+async def admin_ads_hub(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        ad_count = await conn.fetchval("SELECT COUNT(*) FROM ad_posts") or 0
+        min_d = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'ad_delay_min'") or "5"
+        max_d = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'ad_delay_max'") or "15"
+
+    is_running = active_ad_task is not None and not active_ad_task.done()
+    status_str = "🟢 Broadcasting Now" if is_running else "⚪ Idle"
+
+    buttons = [
+        [InlineKeyboardButton(text="➕ Add Advertisement Post", callback_data="admin_add_ad_post")],
+        [InlineKeyboardButton(text=f"⏱ Set Random Delay ({min_d}s - {max_d}s)", callback_data="admin_ad_delay_prompt")],
+        [InlineKeyboardButton(
+            text="▶️ Broadcast Ads" if not is_running else "⏹ Halt Ad Broadcast",
+            callback_data="admin_ad_scope_prompt" if not is_running else "admin_halt_ads"
+        )],
+        [InlineKeyboardButton(text="🗑 Clear Stored Ads", callback_data="admin_clear_ads")],
+        [InlineKeyboardButton(text="🔙 Back to Admin Menu", callback_data="admin_back")]
+    ]
+
+    card = (
+        "📢 <b>Advertisement Control Hub</b>\n\n"
+        f"• <b>Stored Ads:</b> <code>{ad_count}</code>\n"
+        f"• <b>Status:</b> {status_str}\n"
+        f"• <b>Random Interval Range:</b> <code>{min_d}s - {max_d}s</code>\n\n"
+        "Store promotional creatives and broadcast them universally to your channels."
+    )
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, card, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data == "admin_add_ad_post")
+async def admin_add_ad_post(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    await state.set_state(AdminStates.waiting_for_ad_post)
+    await safe_edit_message(
+        callback.message.bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+        "📢 <b>Add Advertisement Post:</b>\n\n"
+        "Send the message (photo, video, album, text, or graphic) that you want to save as an advertisement creative.\n\n"
+        "<i>Send /cancel to return to Ads Hub.</i>"
+    )
+
+
+@router.message(AdminStates.waiting_for_ad_post)
+async def admin_save_ad_post(message: Message, state: FSMContext):
+    if message.from_user.id != get_admin_id():
+        return
+
+    if message.text == "/cancel":
+        await state.clear()
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Ads Hub", callback_data="admin_ads_hub")]])
+        await message.answer("❌ Cancelled.", reply_markup=kb)
+        return
+
+    content_hash = get_message_content_hash(message)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO ad_posts (from_chat_id, message_id, content_hash) VALUES ($1, $2, $3)",
+            message.chat.id, message.message_id, content_hash
+        )
+        total_ads = await conn.fetchval("SELECT COUNT(*) FROM ad_posts")
+
+    await state.clear()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Add Another Ad", callback_data="admin_add_ad_post")],
+            [InlineKeyboardButton(text="📢 Open Ads Hub", callback_data="admin_ads_hub")]
+        ]
+    )
+    await message.answer(f"✅ Advertisement creative saved! Total ads in library: <code>{total_ads}</code>", parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_ad_delay_prompt")
+async def admin_ad_delay_prompt(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    await state.set_state(AdminStates.waiting_for_ad_delay)
+    await safe_edit_message(
+        callback.message.bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+        "⏱ <b>Set Random Interval for Ads:</b>\n\nSend minimum and maximum seconds separated by a dash (e.g. <code>10-30</code>):"
+    )
+
+
+@router.message(AdminStates.waiting_for_ad_delay, F.text)
+async def admin_ad_delay_save(message: Message, state: FSMContext):
+    if message.from_user.id != get_admin_id():
+        return
+    raw = message.text.strip().replace("-", " ").split()
+    if len(raw) != 2 or not raw[0].isdigit() or not raw[1].isdigit():
+        await message.answer("⚠️ Invalid format. Example: <code>10-30</code>.")
+        return
+
+    min_d, max_d = int(raw[0]), int(raw[1])
+    if min_d < 1 or max_d < min_d:
+        await message.answer("⚠️ Minimum must be >= 1 and Maximum must be >= Minimum.")
+        return
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO bot_settings (key, value) VALUES ('ad_delay_min', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", str(min_d))
+        await conn.execute("INSERT INTO bot_settings (key, value) VALUES ('ad_delay_max', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", str(max_d))
+
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Ads Hub", callback_data="admin_ads_hub")]])
+    await message.answer(f"✅ Ad interval set to <code>{min_d}s - {max_d}s</code>.", parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_ad_scope_prompt")
+async def admin_ad_scope_prompt(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        ad_count = await conn.fetchval("SELECT COUNT(*) FROM ad_posts") or 0
+        m_count = await conn.fetchval("SELECT COUNT(*) FROM destinations WHERE is_unmatured = FALSE") or 0
+        u_count = await conn.fetchval("SELECT COUNT(*) FROM destinations WHERE is_unmatured = TRUE") or 0
+
+    if ad_count == 0:
+        await callback.answer("⚠️ No advertisement posts saved yet! Add one first.", show_alert=True)
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=f"🟢 Matured Channels ({m_count})", callback_data="run_ad_broadcast:matured")],
+        [InlineKeyboardButton(text=f"⚪ Unmatured Channels ({u_count})", callback_data="run_ad_broadcast:unmatured")],
+        [InlineKeyboardButton(text=f"🌐 Both Matured & Unmatured ({m_count + u_count})", callback_data="run_ad_broadcast:both")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data="admin_ads_hub")]
+    ]
+    await safe_edit_message(
+        callback.message.bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+        "📢 <b>Choose Target Scope for Ad Broadcast:</b>\n\nWhere should the ads be delivered?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+@router.callback_query(F.data.startswith("run_ad_broadcast:"))
+async def admin_run_ad_broadcast(callback: CallbackQuery, bot: Bot):
+    global active_ad_task
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    scope = callback.data.split(":")[1]
+    active_ad_task = asyncio.create_task(ad_broadcast_worker(bot, target_scope=scope))
+    await callback.answer(f"🚀 Ad broadcast launched on {scope.upper()} channels!", show_alert=True)
+    await admin_ads_hub(callback)
+
+
+@router.callback_query(F.data == "admin_halt_ads")
+async def admin_halt_ads(callback: CallbackQuery):
+    global active_ad_task
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    if active_ad_task and not active_ad_task.done():
+        active_ad_task.cancel()
+        active_ad_task = None
+        await callback.answer("Ad broadcast halted.", show_alert=True)
+    await admin_ads_hub(callback)
+
+
+@router.callback_query(F.data == "admin_clear_ads")
+async def admin_clear_ads(callback: CallbackQuery):
+    await callback.answer("Purged ads")
+    if callback.from_user.id != get_admin_id():
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM ad_posts")
+    await callback.answer("All advertisement creatives cleared.", show_alert=True)
+    await admin_ads_hub(callback)
+
+
+# ==================== CAPTION MODIFIER HUB (QUEUE-WISE) ====================
+
+@router.callback_query(F.data == "admin_caption_hub")
+async def admin_caption_hub(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        queues = await conn.fetch("SELECT id, name FROM queues ORDER BY id ASC")
+
+    if not queues:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")]])
+        await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "⚠️ No queues created yet.", reply_markup=kb)
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=f"📁 Edit Caption: {q['name']}", callback_data=f"q_caption_edit:{q['id']}")]
+        for q in queues
+    ]
+    buttons.append([InlineKeyboardButton(text="🔙 Back to Admin Menu", callback_data="admin_back")])
+
+    text = (
+        "✏️ <b>Queue Caption Editor Hub</b>\n\n"
+        "Select a queue to configure automated <b>Header</b>, <b>Footer</b>, or <b>Telegram Link Replacement</b>:"
+    )
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+async def render_queue_caption_screen(callback: CallbackQuery, queue_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        q = await conn.fetchrow(
+            "SELECT name, caption_header, caption_footer, replace_link_target FROM queues WHERE id = $1",
+            queue_id
+        )
+
+    if not q:
+        await callback.answer("Queue not found.", show_alert=True)
+        return
+
+    h = q["caption_header"] or "<i>None</i>"
+    f = q["caption_footer"] or "<i>None</i>"
+    l = q["replace_link_target"] or "<i>None</i>"
+
+    buttons = [
+        [InlineKeyboardButton(text="🏷 Set Header", callback_data=f"set_q_header:{queue_id}")],
+        [InlineKeyboardButton(text="📝 Set Footer", callback_data=f"set_q_footer:{queue_id}")],
+        [InlineKeyboardButton(text="🔗 Set Link Replacement", callback_data=f"set_q_link:{queue_id}")],
+        [InlineKeyboardButton(text="🗑 Reset Caption Rules", callback_data=f"reset_q_caption:{queue_id}")],
+        [InlineKeyboardButton(text="🔙 Back to Queues", callback_data="admin_caption_hub")]
+    ]
+
+    card = (
+        f"✏️ <b>Caption Rules for:</b> <code>{q['name']}</code>\n\n"
+        f"• <b>Header (Prepended):</b>\n{h}\n\n"
+        f"• <b>Footer (Appended):</b>\n{f}\n\n"
+        f"• <b>Telegram Link Replacement:</b>\n{l}\n\n"
+        "Whenever this queue broadcasts, all captions/texts will automatically adopt these formatting rules."
+    )
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, card, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("q_caption_edit:"))
+async def admin_q_caption_edit(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+    await render_queue_caption_screen(callback, queue_id)
+
+
+@router.callback_query(F.data.startswith("set_q_header:"))
+async def admin_set_q_header_prompt(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+    await state.update_data(active_caption_qid=queue_id)
+    await state.set_state(AdminStates.waiting_for_caption_header)
+    await safe_edit_message(
+        callback.message.bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+        "🏷 <b>Send Caption Header text:</b>\n\n(This text will be added at the top of every post. Send <code>/clear</code> to remove):"
+    )
+
+
+@router.message(AdminStates.waiting_for_caption_header, F.text)
+async def admin_save_q_header(message: Message, state: FSMContext):
+    if message.from_user.id != get_admin_id():
+        return
+    data = await state.get_data()
+    queue_id = data["active_caption_qid"]
+    val = "" if message.text.strip() == "/clear" else message.text.strip()
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE queues SET caption_header = $1 WHERE id = $2", val, queue_id)
+
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Caption Rules", callback_data=f"q_caption_edit:{queue_id}")]])
+    await message.answer("✅ Header updated successfully.", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("set_q_footer:"))
+async def admin_set_q_footer_prompt(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+    await state.update_data(active_caption_qid=queue_id)
+    await state.set_state(AdminStates.waiting_for_caption_footer)
+    await safe_edit_message(
+        callback.message.bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+        "📝 <b>Send Caption Footer text:</b>\n\n(This text will be appended at the end of every post. Send <code>/clear</code> to remove):"
+    )
+
+
+@router.message(AdminStates.waiting_for_caption_footer, F.text)
+async def admin_save_q_footer(message: Message, state: FSMContext):
+    if message.from_user.id != get_admin_id():
+        return
+    data = await state.get_data()
+    queue_id = data["active_caption_qid"]
+    val = "" if message.text.strip() == "/clear" else message.text.strip()
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE queues SET caption_footer = $1 WHERE id = $2", val, queue_id)
+
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Caption Rules", callback_data=f"q_caption_edit:{queue_id}")]])
+    await message.answer("✅ Footer updated successfully.", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("set_q_link:"))
+async def admin_set_q_link_prompt(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+    await state.update_data(active_caption_qid=queue_id)
+    await state.set_state(AdminStates.waiting_for_caption_link)
+    await safe_edit_message(
+        callback.message.bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+        "🔗 <b>Send Telegram Link / Username Replacement:</b>\n\nExample: <code>https://t.me/YourChannel</code> or <code>@YourChannel</code>\n\nAll existing Telegram links in the post will be replaced with this link. Send <code>/clear</code> to disable:"
+    )
+
+
+@router.message(AdminStates.waiting_for_caption_link, F.text)
+async def admin_save_q_link(message: Message, state: FSMContext):
+    if message.from_user.id != get_admin_id():
+        return
+    data = await state.get_data()
+    queue_id = data["active_caption_qid"]
+    val = "" if message.text.strip() == "/clear" else message.text.strip()
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE queues SET replace_link_target = $1 WHERE id = $2", val, queue_id)
+
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Caption Rules", callback_data=f"q_caption_edit:{queue_id}")]])
+    await message.answer("✅ Link replacement target updated successfully.", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("reset_q_caption:"))
+async def admin_reset_q_caption(callback: CallbackQuery):
+    await callback.answer("Resetting...")
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE queues SET caption_header = '', caption_footer = '', replace_link_target = '' WHERE id = $1",
+            queue_id
+        )
+
+    await render_queue_caption_screen(callback, queue_id)
 
 
 # ==================== GLOBAL PROCESS STATS DASHBOARD ====================
@@ -1169,6 +1708,7 @@ async def render_run_hub_detail(callback: CallbackQuery, queue_id: int):
             InlineKeyboardButton(text=f"🔀 Mode: {mode.upper()}", callback_data=f"set_mode_hub:{queue_id}:{toggle_mode}"),
             InlineKeyboardButton(text=f"⏱ {delay_str}", callback_data=f"open_delay_menu:{queue_id}")
         ],
+        [InlineKeyboardButton(text="✏️ Configure Caption Rules", callback_data=f"q_caption_edit:{queue_id}")],
         [
             InlineKeyboardButton(
                 text="▶️ Start Sending Queue" if not is_running else "⏹ Halt Running Queue",
@@ -1185,9 +1725,9 @@ async def render_run_hub_detail(callback: CallbackQuery, queue_id: int):
         f"• <b>Playback Order:</b> <code>{mode.capitalize()}</code>\n"
         f"• <b>Delay Profile:</b> <code>{delay_str}</code>\n"
         f"• <b>Lifetime Launches:</b> <code>{q['run_count']}</code>\n\n"
-        f"💡 <b>Universal Targets:</b>\n"
-        f"• 🟢 All Matured Channels: <code>{m_count}</code>\n"
-        f"• ⚪ All Unmatured Channels: <code>{u_count}</code>\n\n"
+        f"💡 <b>Universal Targets Available:</b>\n"
+        f"• 🟢 Matured Channels: <code>{m_count}</code>\n"
+        f"• ⚪ Unmatured Channels: <code>{u_count}</code>\n\n"
         "Tap <b>Start Sending Queue</b> to choose which category receives this broadcast."
     )
     await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, detail_card, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
@@ -2284,7 +2824,8 @@ async def handle_auto_detect_posts(message: Message, bot: Bot, state: FSMContext
         upload_batches[user_id] = session
 
     content_hash = get_message_content_hash(message)
-    await session.add_post(message.chat.id, message.message_id, content_hash)
+    caption_content = message.caption or message.text or ""
+    await session.add_post(message.chat.id, message.message_id, content_hash, caption=caption_content)
 
 
 # ==================== ADMIN PANEL & QUEUES ====================
@@ -2368,6 +2909,7 @@ async def admin_queue_detail(callback: CallbackQuery):
 
     buttons = [
         [InlineKeyboardButton(text="🚀 Open in Running Hub", callback_data=f"run_hub_q:{queue_id}")],
+        [InlineKeyboardButton(text="✏️ Edit Caption Rules", callback_data=f"q_caption_edit:{queue_id}")],
         [
             InlineKeyboardButton(text="🗑 Clear Posts", callback_data=f"q_clear_posts:{queue_id}"),
             InlineKeyboardButton(text="❌ Delete Queue", callback_data=f"q_delete:{queue_id}")
