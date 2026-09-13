@@ -1,0 +1,2527 @@
+import os
+import random
+import asyncio
+import hashlib
+import asyncpg
+import logging
+from datetime import datetime, timedelta
+from typing import Optional
+from dotenv import load_dotenv
+
+from aiogram import Router, F, Bot
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ChatMemberUpdated,
+    ChatJoinRequest,
+)
+from aiogram.filters import (
+    CommandStart,
+    Command,
+    CommandObject,
+    StateFilter,
+    ChatMemberUpdatedFilter,
+    KICKED,
+    LEFT,
+    RESTRICTED,
+    MEMBER,
+    ADMINISTRATOR,
+)
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
+
+load_dotenv()
+
+router = Router()
+logger = logging.getLogger(__name__)
+
+# ==================== DATABASE CONFIGURATION & POOL ====================
+
+def get_database_url() -> str:
+    url = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PATH") or ""
+    return str(url).strip().strip("'").strip('"')
+
+DATABASE_URL = get_database_url()
+
+def get_admin_id() -> int:
+    raw = os.getenv("ADMIN_ID", "6427894095")
+    clean = str(raw).strip().strip("'").strip('"')
+    return int(clean) if clean.isdigit() else 6427894095
+
+ADMIN_ID = get_admin_id()
+
+# Global asyncpg connection pool & init guard
+db_pool: Optional[asyncpg.Pool] = None
+_db_initialized: bool = False
+
+# Active queue playback & join-accept tasks
+active_tasks: dict[int, asyncio.Task] = {}
+active_join_tasks: dict[str, asyncio.Task] = {}
+
+# Live broadcast progress tracking for stats
+live_broadcast_stats: dict[int, dict] = {}
+
+
+async def get_pool() -> asyncpg.Pool:
+    global db_pool
+    if db_pool is None:
+        db_pool = await asyncpg.create_pool(
+            dsn=DATABASE_URL,
+            min_size=1,
+            max_size=10,
+            ssl="require" if "neon.tech" in DATABASE_URL or "sslmode=require" in DATABASE_URL else None
+        )
+    return db_pool
+
+
+async def init_db():
+    global _db_initialized
+    if _db_initialized:
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS queues (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                destination TEXT,
+                notify_destination TEXT,
+                delay_sec INT DEFAULT 5,
+                delay_min INT DEFAULT 5,
+                delay_max INT DEFAULT 15,
+                delay_type TEXT DEFAULT 'fixed',
+                mode TEXT DEFAULT 'sequence',
+                run_count INT DEFAULT 0
+            );
+        """)
+        await conn.execute("ALTER TABLE queues ADD COLUMN IF NOT EXISTS delay_min INT DEFAULT 5;")
+        await conn.execute("ALTER TABLE queues ADD COLUMN IF NOT EXISTS delay_max INT DEFAULT 15;")
+        await conn.execute("ALTER TABLE queues ADD COLUMN IF NOT EXISTS delay_type TEXT DEFAULT 'fixed';")
+        await conn.execute("ALTER TABLE queues ADD COLUMN IF NOT EXISTS run_count INT DEFAULT 0;")
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS uploaders (
+                user_id BIGINT PRIMARY KEY,
+                name TEXT DEFAULT 'Flezen uploader',
+                queue_id INT REFERENCES queues(id) ON DELETE SET NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS destinations (
+                chat_id TEXT PRIMARY KEY,
+                title TEXT,
+                chat_type TEXT,
+                is_unmatured BOOLEAN DEFAULT FALSE,
+                accept_requests BOOLEAN DEFAULT FALSE,
+                join_delay_min INT DEFAULT 3,
+                join_delay_max INT DEFAULT 10,
+                assigned_queue_id INT REFERENCES queues(id) ON DELETE SET NULL,
+                posts_delivered INT DEFAULT 0,
+                total_accepted INT DEFAULT 0
+            );
+        """)
+        await conn.execute("ALTER TABLE destinations ADD COLUMN IF NOT EXISTS is_unmatured BOOLEAN DEFAULT FALSE;")
+        await conn.execute("ALTER TABLE destinations ADD COLUMN IF NOT EXISTS accept_requests BOOLEAN DEFAULT FALSE;")
+        await conn.execute("ALTER TABLE destinations ADD COLUMN IF NOT EXISTS join_delay_min INT DEFAULT 3;")
+        await conn.execute("ALTER TABLE destinations ADD COLUMN IF NOT EXISTS join_delay_max INT DEFAULT 10;")
+        await conn.execute("ALTER TABLE destinations ADD COLUMN IF NOT EXISTS assigned_queue_id INT REFERENCES queues(id) ON DELETE SET NULL;")
+        await conn.execute("ALTER TABLE destinations ADD COLUMN IF NOT EXISTS posts_delivered INT DEFAULT 0;")
+        await conn.execute("ALTER TABLE destinations ADD COLUMN IF NOT EXISTS total_accepted INT DEFAULT 0;")
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS join_requests (
+                id SERIAL PRIMARY KEY,
+                chat_id TEXT NOT NULL,
+                user_id BIGINT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                approved_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (chat_id, user_id)
+            );
+        """)
+        await conn.execute("ALTER TABLE join_requests ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending';")
+        await conn.execute("ALTER TABLE join_requests ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP;")
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS posts (
+                id SERIAL PRIMARY KEY,
+                queue_id INT REFERENCES queues(id) ON DELETE CASCADE,
+                user_id BIGINT,
+                from_chat_id BIGINT,
+                message_id BIGINT,
+                content_hash TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_queue_content_hash ON posts(queue_id, content_hash);
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_logs (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                queue_id INT,
+                is_duplicate BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.execute("ALTER TABLE user_logs ADD COLUMN IF NOT EXISTS is_duplicate BOOLEAN DEFAULT FALSE;")
+        await conn.execute("ALTER TABLE user_logs ADD COLUMN IF NOT EXISTS queue_id INT;")
+
+    _db_initialized = True
+
+
+# ==================== HELPER FUNCTIONS ====================
+
+def get_message_content_hash(message: Message) -> str:
+    if message.photo:
+        return f"photo_{message.photo[-1].file_unique_id}"
+    elif message.video:
+        return f"video_{message.video.file_unique_id}"
+    elif message.document:
+        return f"doc_{message.document.file_unique_id}"
+    elif message.animation:
+        return f"anim_{message.animation.file_unique_id}"
+    elif message.audio:
+        return f"audio_{message.audio.file_unique_id}"
+    elif message.voice:
+        return f"voice_{message.voice.file_unique_id}"
+    elif message.video_note:
+        return f"vnote_{message.video_note.file_unique_id}"
+    elif message.text:
+        return f"text_{hashlib.md5(message.text.strip().encode('utf-8')).hexdigest()}"
+    elif message.caption:
+        return f"caption_{hashlib.md5(message.caption.strip().encode('utf-8')).hexdigest()}"
+    return f"msg_{message.message_id}"
+
+
+def format_eta(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds == 0:
+        return "0 sec"
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    parts = []
+    if hours > 0:
+        parts.append(f"{hours} hr")
+    if minutes > 0 or hours > 0:
+        parts.append(f"{minutes} min")
+    if secs > 0 or len(parts) == 0:
+        parts.append(f"{secs} sec")
+    return " ".join(parts)
+
+
+async def check_bot_broadcast_permission(bot: Bot, chat_id: str) -> str:
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=me.id)
+        status = member.status
+        if status in ["administrator", "creator"]:
+            can_post = getattr(member, "can_post_messages", None)
+            can_send = getattr(member, "can_send_messages", None)
+            if can_post is False and can_send is False:
+                return "🔴 Admin (Posting Restricted)"
+            return "🟢 Can Broadcast (Admin/Creator)"
+        elif status == "member":
+            return "🟡 Member status (May lack direct channel post rights)"
+        return f"🔴 Restricted status ({status})"
+    except Exception as e:
+        err_msg = str(e)
+        if "chat not found" in err_msg.lower():
+            return "🔴 Chat not found / Bot not added"
+        return f"🔴 Permission check error ({err_msg[:25]})"
+
+
+# ==================== RATE-LIMITED NOTIFICATION DISPATCHER ====================
+
+async def safe_send_message(bot: Bot, chat_id: str | int, text: str) -> Optional[Message]:
+    try:
+        return await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after + 0.5)
+        try:
+            return await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+async def safe_edit_message(bot: Bot, chat_id: str | int, message_id: int, text: str, reply_markup=None):
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, parse_mode="HTML", reply_markup=reply_markup)
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after + 0.5)
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, parse_mode="HTML", reply_markup=reply_markup)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+async def safe_delete_message(bot: Bot, chat_id: int | str, message_id: int):
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+async def dispatch_notification(bot: Bot, message_text: str, queue_id: Optional[int] = None):
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            master_dest = await conn.fetchval(
+                "SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'"
+            )
+            queue_dest = None
+            if queue_id:
+                queue_dest = await conn.fetchval(
+                    "SELECT notify_destination FROM queues WHERE id = $1", queue_id
+                )
+
+        if master_dest:
+            await safe_send_message(bot, master_dest, message_text)
+        if queue_dest and queue_dest != master_dest:
+            await safe_send_message(bot, queue_dest, message_text)
+    except Exception:
+        pass
+
+
+# ==================== CHAT JOIN REQUEST LISTENER & WORKER ====================
+
+@router.chat_join_request()
+async def handle_join_request(event: ChatJoinRequest, bot: Bot):
+    chat_id = str(event.chat.id)
+    user_id = event.from_user.id
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        dest = await conn.fetchrow(
+            "SELECT accept_requests, title FROM destinations WHERE chat_id = $1", chat_id
+        )
+        await conn.execute(
+            "INSERT INTO join_requests (chat_id, user_id, status) VALUES ($1, $2, 'pending') ON CONFLICT (chat_id, user_id) DO NOTHING",
+            chat_id, user_id
+        )
+
+    if dest and dest["accept_requests"]:
+        if chat_id not in active_join_tasks or active_join_tasks[chat_id].done():
+            task = asyncio.create_task(join_request_worker(bot, chat_id))
+            active_join_tasks[chat_id] = task
+
+
+async def join_request_worker(bot: Bot, chat_id: str):
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            dest = await conn.fetchrow(
+                "SELECT title, accept_requests, join_delay_min, join_delay_max FROM destinations WHERE chat_id = $1",
+                chat_id
+            )
+
+        if not dest or not dest["accept_requests"]:
+            return
+
+        chat_title = dest["title"] or chat_id
+        min_delay = dest["join_delay_min"] or 3
+        max_delay = dest["join_delay_max"] or 10
+        accepted_count = 0
+
+        while True:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                active = await conn.fetchval(
+                    "SELECT accept_requests FROM destinations WHERE chat_id = $1", chat_id
+                )
+                if not active:
+                    break
+
+                row = await conn.fetchrow(
+                    "SELECT id, user_id FROM join_requests WHERE chat_id = $1 AND status = 'pending' ORDER BY id ASC LIMIT 1",
+                    chat_id
+                )
+
+            if not row:
+                break
+
+            req_id, user_id = row["id"], row["user_id"]
+
+            try:
+                await bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
+                accepted_count += 1
+                async with pool.acquire() as conn:
+                    await conn.execute("UPDATE destinations SET total_accepted = total_accepted + 1 WHERE chat_id = $1", chat_id)
+            except Exception:
+                pass
+
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute("UPDATE join_requests SET status = 'accepted', approved_at = CURRENT_TIMESTAMP WHERE id = $1", req_id)
+
+            sleep_duration = random.randint(min(min_delay, max_delay), max(min_delay, max_delay))
+            await asyncio.sleep(sleep_duration)
+
+        if accepted_count > 0:
+            await dispatch_notification(
+                bot,
+                f"🤝 <b>Join Requests Auto-Approved</b>\n\n"
+                f"• <b>Destination:</b> <b>{chat_title}</b> (<code>{chat_id}</code>)\n"
+                f"• <b>Total Accepted in Run:</b> <code>{accepted_count}</code> member(s)\n"
+                f"• <b>Random Delay:</b> <code>{min_delay}s - {max_delay}s</code>"
+            )
+
+    except asyncio.CancelledError:
+        pass
+    finally:
+        active_join_tasks.pop(chat_id, None)
+
+
+# ==================== LIVE BATCH AGGREGATOR ====================
+
+class UploadBatchSession:
+    def __init__(self, user_id: int, user_chat_id: int, queue_id: int, uploader_name: str, queue_name: str, bot: Bot):
+        self.user_id = user_id
+        self.user_chat_id = user_chat_id
+        self.queue_id = queue_id
+        self.uploader_name = uploader_name
+        self.queue_name = queue_name
+        self.bot = bot
+        
+        self.queued_count = 0
+        self.duplicate_count = 0
+        self.pending_posts = []
+        self.pending_dup_logs = 0
+        self.user_msg_id: Optional[int] = None
+        
+        self.log_messages: dict[str, int] = {}
+        self.debounce_task: Optional[asyncio.Task] = None
+        self.last_sync_time = 0.0
+        self.lock = asyncio.Lock()
+
+    async def add_post(self, from_chat_id: int, message_id: int, content_hash: str):
+        async with self.lock:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                is_duplicate = await conn.fetchval(
+                    "SELECT 1 FROM posts WHERE queue_id = $1 AND content_hash = $2 LIMIT 1",
+                    self.queue_id, content_hash
+                )
+
+            in_memory_dup = any(h == content_hash for _, _, h in self.pending_posts)
+
+            if is_duplicate or in_memory_dup:
+                self.duplicate_count += 1
+                self.pending_dup_logs += 1
+            else:
+                self.queued_count += 1
+                self.pending_posts.append((from_chat_id, message_id, content_hash))
+
+            if self.debounce_task and not self.debounce_task.done():
+                self.debounce_task.cancel()
+            self.debounce_task = asyncio.create_task(self._debounce_flush())
+
+    async def _flush_to_db(self):
+        to_insert = list(self.pending_posts)
+        self.pending_posts.clear()
+        dup_logs = self.pending_dup_logs
+        self.pending_dup_logs = 0
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            if to_insert:
+                await conn.executemany(
+                    "INSERT INTO posts (queue_id, user_id, from_chat_id, message_id, content_hash) VALUES ($1, $2, $3, $4, $5)",
+                    [(self.queue_id, self.user_id, fc, mi, ch) for fc, mi, ch in to_insert]
+                )
+                await conn.executemany(
+                    "INSERT INTO user_logs (user_id, queue_id, is_duplicate) VALUES ($1, $2, FALSE)",
+                    [(self.user_id, self.queue_id) for _ in to_insert]
+                )
+            if dup_logs > 0:
+                await conn.executemany(
+                    "INSERT INTO user_logs (user_id, queue_id, is_duplicate) VALUES ($1, $2, TRUE)",
+                    [(self.user_id, self.queue_id) for _ in range(dup_logs)]
+                )
+
+    async def _update_ui(self, is_final: bool = False):
+        now = asyncio.get_event_loop().time()
+        if not is_final and (now - self.last_sync_time < 2.5):
+            return
+
+        self.last_sync_time = now
+        await self._flush_to_db()
+
+        if is_final:
+            if self.user_msg_id:
+                await safe_delete_message(self.bot, self.user_chat_id, self.user_msg_id)
+                self.user_msg_id = None
+            
+            dup_text = f"\n⚠️ Total Duplicates Skipped: <code>{self.duplicate_count}</code>" if self.duplicate_count > 0 else ""
+            await safe_send_message(
+                self.bot,
+                self.user_chat_id,
+                f"✅ <b>Upload Completed!</b>\nSuccessfully queued <code>{self.queued_count}</code> post(s) into <b>{self.queue_name}</b>.{dup_text}"
+            )
+        else:
+            dup_line = f"\n• ⚠️ Duplicates Skipped: <code>{self.duplicate_count}</code>" if self.duplicate_count > 0 else ""
+            status_text = (
+                f"📥 <b>Auto-detecting posts...</b>\n"
+                f"• Queue: <b>{self.queue_name}</b>\n"
+                f"• New Posts Queued: <code>{self.queued_count}</code>{dup_line}"
+            )
+            if self.user_msg_id:
+                await safe_edit_message(self.bot, self.user_chat_id, self.user_msg_id, status_text)
+            else:
+                msg = await safe_send_message(self.bot, self.user_chat_id, status_text)
+                if msg:
+                    self.user_msg_id = msg.message_id
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            master_dest = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
+            q_dest = await conn.fetchval("SELECT notify_destination FROM queues WHERE id = $1", self.queue_id)
+
+        target_channels = set()
+        if master_dest:
+            target_channels.add(master_dest)
+        if q_dest:
+            target_channels.add(q_dest)
+
+        status_tag = "✅ <b>Batch Upload Completed</b>" if is_final else "📥 <b>Batch Upload in Progress...</b>"
+        dup_log_line = f"\n• <b>Duplicates Skipped:</b> <code>{self.duplicate_count}</code>" if self.duplicate_count > 0 else ""
+        log_text = (
+            f"{status_tag}\n\n"
+            f"• <b>Flezen Uploader:</b> {self.uploader_name} (<code>{self.user_id}</code>)\n"
+            f"• <b>Target Queue:</b> <code>{self.queue_name}</code>\n"
+            f"• <b>New Posts Queued:</b> <code>{self.queued_count}</code>"
+            f"{dup_log_line}\n"
+            f"• <b>Status:</b> {'Finalized' if is_final else 'Receiving & filtering...'}"
+        )
+
+        for cid in target_channels:
+            if cid in self.log_messages:
+                await safe_edit_message(self.bot, cid, self.log_messages[cid], log_text)
+            else:
+                sent = await safe_send_message(self.bot, cid, log_text)
+                if sent:
+                    self.log_messages[cid] = sent.message_id
+
+    async def _debounce_flush(self):
+        try:
+            while True:
+                await asyncio.sleep(3.0)
+                async with self.lock:
+                    if not self.pending_posts and self.pending_dup_logs == 0:
+                        break
+                    await self._update_ui(is_final=False)
+
+            async with self.lock:
+                await self._update_ui(is_final=True)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            upload_batches.pop(self.user_id, None)
+
+
+upload_batches: dict[int, UploadBatchSession] = {}
+
+
+# ==================== FSM STATES ====================
+
+class AdminStates(StatesGroup):
+    waiting_for_queue_name = State()
+    waiting_for_destination_manual = State()
+    waiting_for_master_log_manual = State()
+    waiting_for_fixed_delay = State()
+    waiting_for_random_delay = State()
+    waiting_for_join_delay = State()
+    waiting_for_uploader_id = State()
+    waiting_for_uploader_name = State()
+
+
+# ==================== AUTO-DISCOVERY OF BOT'S CHANNELS/GROUPS ====================
+
+@router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=ADMINISTRATOR))
+async def bot_added_as_admin(event: ChatMemberUpdated, bot: Bot):
+    chat = event.chat
+    chat_id = str(chat.id)
+    chat_title = chat.title or chat.username or "Unnamed Destination"
+    chat_type = chat.type
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO destinations (chat_id, title, chat_type)
+            VALUES ($1, $2, $3)
+            ON CONFLICT(chat_id) DO UPDATE SET title = EXCLUDED.title, chat_type = EXCLUDED.chat_type
+            """,
+            chat_id, chat_title, chat_type
+        )
+
+    log_msg = (
+        f"📢 <b>New Destination Connected!</b>\n\n"
+        f"• <b>Title:</b> {chat_title}\n"
+        f"• <b>ID:</b> <code>{chat_id}</code>\n"
+        f"• <b>Type:</b> {chat_type.capitalize()}\n\n"
+        "You can configure this as a Broadcast Destination, Unmatured Destination, or Master Log Channel."
+    )
+    await dispatch_notification(bot, log_msg)
+
+    admin_target = get_admin_id()
+    if admin_target:
+        await safe_send_message(bot, admin_target, log_msg)
+
+
+@router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=(KICKED | LEFT | RESTRICTED | MEMBER)))
+async def bot_removed_from_admin(event: ChatMemberUpdated, bot: Bot):
+    chat_id = str(event.chat.id)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM destinations WHERE chat_id = $1", chat_id)
+        await conn.execute(
+            "DELETE FROM bot_settings WHERE key = 'master_log_chat_id' AND value = $1", chat_id
+        )
+
+    await dispatch_notification(
+        bot,
+        f"⚠️ <b>Bot Removed as Admin</b>\nRemoved from chat ID: <code>{chat_id}</code>."
+    )
+
+
+# ==================== KEYBOARDS ====================
+
+def get_user_main_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🚀 Start Task"), KeyboardButton(text="📊 Check Stats")],
+            [KeyboardButton(text="⏹ Finish Uploading")]
+        ],
+        resize_keyboard=True
+    )
+
+async def get_admin_main_kb() -> InlineKeyboardMarkup:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        dest_count = await conn.fetchval("SELECT COUNT(*) FROM destinations")
+        master_log = await conn.fetchval(
+            "SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'"
+        )
+
+    master_label = f"📋 Master Log: {master_log[:15]}..." if master_log else "📋 Set Master Log"
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📂 Manage Queues", callback_data="admin_manage_hub")],
+            [InlineKeyboardButton(text="📈 Matrix", callback_data="admin_matrix_hub")],
+            [InlineKeyboardButton(text="👤 Add Flezen Uploader", callback_data="admin_add_uploader")],
+            [InlineKeyboardButton(text=f"📡 Available Destinations ({dest_count})", callback_data="admin_view_destinations")],
+            [InlineKeyboardButton(text=master_label, callback_data="admin_set_master_log_screen")],
+            [InlineKeyboardButton(text="❌ Close Menu", callback_data="admin_close")]
+        ]
+    )
+
+
+# ==================== COMMAND: /addest ====================
+
+@router.message(Command("addest"))
+async def cmd_addest(message: Message, command: CommandObject):
+    if message.from_user.id != get_admin_id():
+        return
+
+    args = command.args
+    if not args:
+        await message.answer(
+            "⚠️ <b>Invalid Command Format!</b>\n\n"
+            "<b>Usage:</b>\n"
+            "<code>/addest GroupNickName numerical_id</code>\n\n"
+            "<b>Example:</b>\n"
+            "<code>/addest VIP_Channel -1001234567890</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    parts = args.strip().split()
+    if len(parts) < 2:
+        await message.answer(
+            "⚠️ <b>Missing Arguments!</b>\n\n"
+            "Please provide both a channel/destination name and its numerical ID.\n"
+            "<b>Example:</b> <code>/addest VIP_Channel -1001234567890</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    nickname = parts[0].strip()
+    numerical_id = parts[1].strip()
+
+    clean_id = numerical_id.lstrip("-")
+    if not clean_id.isdigit():
+        await message.answer("⚠️ <b>Invalid Chat ID!</b> Numerical ID must be numbers only (e.g., <code>-1001234567890</code>).", parse_mode="HTML")
+        return
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO destinations (chat_id, title, chat_type, is_unmatured)
+            VALUES ($1, $2, 'channel', FALSE)
+            ON CONFLICT (chat_id) DO UPDATE SET title = EXCLUDED.title
+            """,
+            numerical_id, nickname
+        )
+        queues = await conn.fetch("SELECT id, name FROM queues ORDER BY id ASC")
+
+    if not queues:
+        await message.answer(
+            f"✅ <b>Destination Registered Successfully!</b>\n\n"
+            f"• <b>Name:</b> {nickname}\n"
+            f"• <b>ID:</b> <code>{numerical_id}</code>\n\n"
+            "⚠️ <i>Please create a queue first so you can bind this destination as a broadcast target.</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=f"📁 Bind as Target for: {q['name']}", callback_data=f"confirm_broadcast_bind:{numerical_id}:{q['id']}")]
+        for q in queues
+    ]
+    buttons.append([InlineKeyboardButton(text="⚙️ Open Destination Actions", callback_data=f"dest_actions:{numerical_id}")])
+
+    await message.answer(
+        f"✅ <b>Destination Registered Successfully!</b>\n\n"
+        f"• <b>Name:</b> {nickname}\n"
+        f"• <b>ID:</b> <code>{numerical_id}</code>\n\n"
+        "Select which broadcast queue should deliver to this destination:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+# ==================== HUBS: MANAGE & MATRIX ====================
+
+@router.callback_query(F.data == "admin_manage_hub")
+async def admin_manage_hub(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📂 List & Manage Queues", callback_data="admin_list_queues")],
+        [InlineKeyboardButton(text="🚀 Running Queues Hub", callback_data="admin_running_queues")],
+        [InlineKeyboardButton(text="➕ Create Queue", callback_data="admin_create_queue")],
+        [InlineKeyboardButton(text="🔙 Back to Admin Menu", callback_data="admin_back")]
+    ])
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "📂 <b>Manage Queues Hub</b>\n\nChoose an option:", reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_matrix_hub")
+async def admin_matrix_hub(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Global Process Stats", callback_data="admin_global_process_stats")],
+        [InlineKeyboardButton(text="👤 Uploader Stats", callback_data="admin_view_uploaders")],
+        [InlineKeyboardButton(text="📡 Destination Broadcast Permission Check", callback_data="admin_matrix_dest_perm")],
+        [InlineKeyboardButton(text="🤝 Destination Joining Stats", callback_data="admin_matrix_joining")],
+        [InlineKeyboardButton(text="🔙 Back to Admin Menu", callback_data="admin_back")]
+    ])
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "📈 <b>Admin Matrix Hub</b>\n\nSelect a metric/status category:", reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_matrix_dest_perm")
+async def admin_matrix_dest_perm(callback: CallbackQuery, bot: Bot):
+    await callback.answer("Checking broadcast permissions...")
+    if callback.from_user.id != get_admin_id():
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        dests = await conn.fetch("SELECT chat_id, title FROM destinations ORDER BY title ASC")
+
+    if not dests:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_matrix_hub")]])
+        await safe_edit_message(bot, callback.message.chat.id, callback.message.message_id, "📡 <b>Broadcast Permission Check</b>\n\nNo destinations registered.", reply_markup=kb)
+        return
+
+    report = ["📡 <b>Destination Broadcast Permission Status:</b>\n"]
+    for d in dests:
+        status_str = await check_bot_broadcast_permission(bot, d["chat_id"])
+        report.append(f"• <b>{d['title'] or d['chat_id']}</b>: {status_str}")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Re-check Permissions", callback_data="admin_matrix_dest_perm")],
+        [InlineKeyboardButton(text="🔙 Back to Matrix Hub", callback_data="admin_matrix_hub")]
+    ])
+    await safe_edit_message(bot, callback.message.chat.id, callback.message.message_id, "\n".join(report), reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_matrix_joining")
+async def admin_matrix_joining(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    now = datetime.utcnow()
+    day_ago = now - timedelta(days=1)
+    week_ago = now - timedelta(days=7)
+    month_ago = now - timedelta(days=30)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        destinations = await conn.fetch("SELECT * FROM destinations ORDER BY title ASC")
+        pending_map = {row["chat_id"]: row["count"] for row in await conn.fetch("SELECT chat_id, COUNT(*) as count FROM join_requests WHERE status='pending' GROUP BY chat_id")}
+
+    report = ["🤝 <b>Destination Joining & Approval Stats:</b>\n"]
+    for d in destinations:
+        cid = d["chat_id"]
+        title = d["title"] or cid
+        accepting = d["accept_requests"]
+        pending = pending_map.get(cid, 0)
+        status_tag = "🟢 Accepting Joining" if accepting else "⚪ Pause Joining"
+
+        d_app = await pool.fetchval("SELECT COUNT(*) FROM join_requests WHERE chat_id=$1 AND status='accepted' AND approved_at >= $2", cid, day_ago)
+        w_app = await pool.fetchval("SELECT COUNT(*) FROM join_requests WHERE chat_id=$1 AND status='accepted' AND approved_at >= $2", cid, week_ago)
+        m_app = await pool.fetchval("SELECT COUNT(*) FROM join_requests WHERE chat_id=$1 AND status='accepted' AND approved_at >= $2", cid, month_ago)
+
+        report.append(
+            f"• <b>{title}</b> (ID: <code>{cid}</code>)\n"
+            f"  ├ Status: {status_tag}\n"
+            f"  ├ Pending Requests: <code>{pending}</code>\n"
+            f"  └ Approved | Day: <code>{d_app}</code> | Week: <code>{w_app}</code> | Month: <code>{m_app}</code>\n"
+        )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Refresh", callback_data="admin_matrix_joining")],
+        [InlineKeyboardButton(text="🔙 Back to Matrix Hub", callback_data="admin_matrix_hub")]
+    ])
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "\n".join(report), reply_markup=kb)
+
+
+# ==================== BROADCAST WORKER ====================
+
+async def broadcast_worker(bot: Bot, queue_id: int):
+    admin_chat_id = get_admin_id()
+    admin_msg_id: Optional[int] = None
+    master_msg_id: Optional[int] = None
+    master_dest: Optional[str] = None
+    qname = f"Queue_{queue_id}"
+
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE queues SET run_count = run_count + 1 WHERE id = $1", queue_id)
+            q = await conn.fetchrow(
+                "SELECT name, destination, delay_sec, delay_min, delay_max, delay_type, mode FROM queues WHERE id = $1",
+                queue_id
+            )
+            unmatured_targets = await conn.fetch(
+                "SELECT chat_id, title FROM destinations WHERE assigned_queue_id = $1", queue_id
+            )
+            master_dest = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
+            items = await conn.fetch(
+                "SELECT from_chat_id, message_id FROM posts WHERE queue_id = $1 ORDER BY id ASC",
+                queue_id
+            )
+
+        if not q or not items:
+            return
+
+        target_chat_ids = []
+        target_titles = []
+
+        if q["destination"]:
+            target_chat_ids.append(q["destination"])
+            async with pool.acquire() as conn:
+                d = await conn.fetchrow("SELECT title FROM destinations WHERE chat_id = $1", q["destination"])
+            target_titles.append(d["title"] if d else q["destination"])
+
+        for u in unmatured_targets:
+            if u["chat_id"] not in target_chat_ids:
+                target_chat_ids.append(u["chat_id"])
+                target_titles.append(f"{u['title']} (Unmatured)")
+
+        if not target_chat_ids:
+            return
+
+        qname = q["name"]
+        delay_type = q["delay_type"] or "fixed"
+        mode = q["mode"] or "sequence"
+        dest_display = ", ".join(target_titles)
+
+        items = list(items)
+        if mode == "shuffle":
+            random.shuffle(items)
+
+        total_posts = len(items)
+
+        live_broadcast_stats[queue_id] = {
+            "name": qname,
+            "sent": 0,
+            "total": total_posts,
+            "eta_seconds": 0.0,
+            "destination": dest_display,
+            "mode": mode,
+            "delay_type": delay_type
+        }
+
+        init_text = (
+            f"🚀 <b>Broadcast Started</b>\n\n"
+            f"• <b>Queue:</b> <code>{qname}</code>\n"
+            f"• <b>Target Channels:</b> <b>{dest_display}</b>\n"
+            f"• <b>Total Posts:</b> <code>{total_posts}</code>\n"
+            f"• <b>Order:</b> <code>{mode.upper()}</code>\n"
+            f"• <b>Delay Profile:</b> <code>{delay_type.upper()}</code>\n"
+            f"• <b>Progress:</b> 0 out of {total_posts}\n"
+            f"• <b>Estimated Time Remaining:</b> Calculating..."
+        )
+
+        if admin_chat_id:
+            m = await safe_send_message(bot, admin_chat_id, init_text)
+            if m:
+                admin_msg_id = m.message_id
+        if master_dest:
+            m = await safe_send_message(bot, master_dest, init_text)
+            if m:
+                master_msg_id = m.message_id
+
+        sent_count = 0
+        for post in items:
+            for cid in target_chat_ids:
+                try:
+                    await bot.copy_message(
+                        chat_id=cid,
+                        from_chat_id=post["from_chat_id"],
+                        message_id=post["message_id"]
+                    )
+                    async with pool.acquire() as conn:
+                        await conn.execute("UPDATE destinations SET posts_delivered = posts_delivered + 1 WHERE chat_id = $1", cid)
+                except Exception:
+                    pass
+
+            sent_count += 1
+
+            if delay_type == "random":
+                min_d = q["delay_min"] or 5
+                max_d = q["delay_max"] or 15
+                chosen_delay = random.randint(min(min_d, max_d), max(min_d, max_d))
+                avg_delay = (min_d + max_d) / 2
+            else:
+                chosen_delay = q["delay_sec"] or 5
+                avg_delay = chosen_delay
+
+            remaining_posts = total_posts - sent_count
+            eta_seconds = remaining_posts * avg_delay
+            eta_str = format_eta(eta_seconds)
+
+            live_broadcast_stats[queue_id]["sent"] = sent_count
+            live_broadcast_stats[queue_id]["eta_seconds"] = eta_seconds
+
+            if remaining_posts > 0:
+                progress_text = (
+                    f"🚀 <b>Running Queue: {qname}</b>\n\n"
+                    f"• <b>Destinations:</b> <b>{dest_display}</b>\n"
+                    f"• <b>Progress:</b> Completed <code>{sent_count}</code> out of <code>{total_posts}</code>\n"
+                    f"• <b>Estimated Time Remaining:</b> <code>{eta_str}</code>\n"
+                    f"• <b>Mode:</b> {mode.upper()} | <b>Delay:</b> {chosen_delay}s ({delay_type})"
+                )
+
+                if admin_chat_id and admin_msg_id:
+                    await safe_edit_message(bot, admin_chat_id, admin_msg_id, progress_text)
+                if master_dest and master_msg_id:
+                    await safe_edit_message(bot, master_dest, master_msg_id, progress_text)
+
+                await asyncio.sleep(chosen_delay)
+
+        final_text = (
+            f"🏁 <b>Broadcast Completed Successfully!</b>\n\n"
+            f"• <b>Queue:</b> <code>{qname}</code>\n"
+            f"• <b>Delivered Destinations:</b> <b>{dest_display}</b>\n"
+            f"• <b>Total Processed:</b> <code>{sent_count} / {total_posts}</code> posts\n"
+            f"• <b>Status:</b> Finished & Idle"
+        )
+
+        if admin_chat_id and admin_msg_id:
+            await safe_edit_message(bot, admin_chat_id, admin_msg_id, final_text)
+        if master_dest and master_msg_id:
+            await safe_edit_message(bot, master_dest, master_msg_id, final_text)
+
+    except asyncio.CancelledError:
+        halt_text = f"⏹ <b>Broadcast Stopped:</b> Queue <code>{qname}</code> was stopped by the admin."
+        if admin_chat_id and admin_msg_id:
+            await safe_edit_message(bot, admin_chat_id, admin_msg_id, halt_text)
+        if master_dest and master_msg_id:
+            await safe_edit_message(bot, master_dest, master_msg_id, halt_text)
+    finally:
+        active_tasks.pop(queue_id, None)
+        live_broadcast_stats.pop(queue_id, None)
+
+
+# ==================== GLOBAL PROCESS STATS DASHBOARD ====================
+
+@router.callback_query(F.data == "admin_global_process_stats")
+async def admin_global_process_stats(callback: CallbackQuery):
+    await callback.answer("Loading global stats...")
+    if callback.from_user.id != get_admin_id():
+        return
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        all_queues = await conn.fetch("SELECT id, name, destination, delay_sec, mode, run_count FROM queues ORDER BY id ASC")
+        destinations = await conn.fetch("SELECT chat_id, title, is_unmatured, accept_requests, join_delay_min, join_delay_max, posts_delivered, total_accepted FROM destinations ORDER BY title ASC")
+        queue_post_counts = await conn.fetch("SELECT queue_id, COUNT(*) as count FROM posts GROUP BY queue_id")
+        join_pending_counts = await conn.fetch("SELECT chat_id, COUNT(*) as count FROM join_requests WHERE status = 'pending' GROUP BY chat_id")
+        master_log_id = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
+
+    posts_map = {row["queue_id"]: row["count"] for row in queue_post_counts}
+    join_pending_map = {row["chat_id"]: row["count"] for row in join_pending_counts}
+
+    report = ["📊 <b>GLOBAL PROCESS & PERFORMANCE DASHBOARD</b>\n"]
+
+    report.append("🚀 <b>Active Broadcast Queues:</b>")
+    active_broadcast_count = 0
+
+    for qid, task in list(active_tasks.items()):
+        if not task.done() and qid in live_broadcast_stats:
+            active_broadcast_count += 1
+            info = live_broadcast_stats[qid]
+            eta_str = format_eta(info["eta_seconds"])
+            report.append(
+                f"• <b>{info['name']}</b>\n"
+                f"  ├ Already Sent: <code>{info['sent']} / {info['total']}</code> posts\n"
+                f"  ├ Destinations: <code>{info['destination']}</code>\n"
+                f"  ├ Order: <code>{info['mode'].upper()}</code>\n"
+                f"  └ ⏳ <b>Estimated Time Required:</b> <code>{eta_str}</code>\n"
+            )
+
+    if active_broadcast_count == 0:
+        report.append("<i>No broadcast queues are currently running.</i>\n")
+
+    report.append("🤝 <b>Join Request & Unmatured Channels:</b>")
+    dest_join_count = 0
+
+    for d in destinations:
+        cid = d["chat_id"]
+        title = d["title"] or cid
+        is_unmatured = d["is_unmatured"]
+        accepting = d["accept_requests"]
+        pending = join_pending_map.get(cid, 0)
+        accepted = d["total_accepted"] or 0
+        total_requests = accepted + pending
+
+        min_d = d["join_delay_min"] or 3
+        max_d = d["join_delay_max"] or 10
+
+        if is_unmatured or accepting or total_requests > 0:
+            dest_join_count += 1
+            accept_tag = "🟢 Accepting" if accepting else "⚪ Paused"
+            avg_delay = (min_d + max_d) / 2
+            eta_val = pending * avg_delay if accepting else 0
+            eta_str = format_eta(eta_val) if accepting and pending > 0 else "Paused / None"
+
+            type_label = "Unmatured" if is_unmatured else "Broadcast"
+            report.append(
+                f"• <b>{title}</b> ({type_label})\n"
+                f"  ├ Status: {accept_tag}\n"
+                f"  ├ Requests: Done <code>{accepted}</code> out of <code>{total_requests}</code> (Pending: <code>{pending}</code>)\n"
+                f"  ├ Delay: <code>{min_d}s - {max_d}s</code>\n"
+                f"  └ ⏳ <b>Estimated Time Required:</b> <code>{eta_str}</code>\n"
+            )
+
+    if dest_join_count == 0:
+        report.append("<i>No active join request pipelines configured.</i>\n")
+
+    report.append("📁 <b>Queue Inventory & Performance:</b>")
+    if all_queues:
+        for q in all_queues:
+            qid = q["id"]
+            qname = q["name"]
+            curr_posts = posts_map.get(qid, 0)
+            runs = q["run_count"] or 0
+            report.append(
+                f"• <b>{qname}</b> (ID: <code>{qid}</code>)\n"
+                f"  ├ Saved Posts in DB: <code>{curr_posts}</code>\n"
+                f"  └ Lifetime Execution: <code>{runs}</code> time(s) run\n"
+            )
+    else:
+        report.append("<i>No queues created yet.</i>\n")
+
+    report.append("📡 <b>Destination Health & Delivery:</b>")
+    if destinations:
+        for d in destinations:
+            cid = d["chat_id"]
+            title = d["title"] or cid
+            delivered = d["posts_delivered"] or 0
+            is_master = (cid == master_log_id)
+            roles = []
+            if is_master:
+                roles.append("Master Log")
+            if d["is_unmatured"]:
+                roles.append("Unmatured")
+            else:
+                roles.append("Broadcast")
+
+            role_tag = ", ".join(roles)
+            report.append(f"• <b>{title}</b> [{role_tag}]: <code>{delivered}</code> posts posted")
+    else:
+        report.append("<i>No destinations connected.</i>")
+
+    buttons = [
+        [InlineKeyboardButton(text="🔄 Refresh Live Stats", callback_data="admin_global_process_stats")],
+        [InlineKeyboardButton(text="🚀 Running Queues Hub", callback_data="admin_running_queues")],
+        [InlineKeyboardButton(text="🔙 Back to Matrix Hub", callback_data="admin_matrix_hub")]
+    ]
+
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "\n".join(report), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+# ==================== RUNNING QUEUE HUB ====================
+
+async def render_run_hub_detail(callback: CallbackQuery, queue_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        q = await conn.fetchrow("SELECT * FROM queues WHERE id = $1", queue_id)
+        post_count = await conn.fetchval("SELECT COUNT(*) FROM posts WHERE queue_id = $1", queue_id)
+        dest_title = None
+        if q and q["destination"]:
+            d = await conn.fetchrow("SELECT title FROM destinations WHERE chat_id = $1", q["destination"])
+            dest_title = d["title"] if d else q["destination"]
+
+    if not q:
+        await callback.answer("Queue not found.", show_alert=True)
+        return
+
+    is_running = queue_id in active_tasks and not active_tasks[queue_id].done()
+    status_str = "🟢 Active (Sending)" if is_running else "⚪ Idle (Ready)"
+    dest_str = dest_title or "⚠️ Not configured"
+    mode = q["mode"] or "sequence"
+    delay_type = q["delay_type"] or "fixed"
+
+    if delay_type == "random":
+        delay_str = f"Random ({q['delay_min']}s - {q['delay_max']}s)"
+    else:
+        delay_str = f"Fixed ({q['delay_sec']}s)"
+
+    toggle_mode = "sequence" if mode == "shuffle" else "shuffle"
+
+    buttons = [
+        [
+            InlineKeyboardButton(text=f"🔀 Mode: {mode.upper()}", callback_data=f"set_mode_hub:{queue_id}:{toggle_mode}"),
+            InlineKeyboardButton(text=f"⏱ {delay_str}", callback_data=f"open_delay_menu:{queue_id}")
+        ],
+        [
+            InlineKeyboardButton(text="🎯 Set/Change Target Destination", callback_data=f"q_pick_dest:{queue_id}")
+        ],
+        [
+            InlineKeyboardButton(
+                text="▶️ Start Sending Queue" if not is_running else "⏹ Halt Running Queue",
+                callback_data=f"toggle_run_hub:{queue_id}"
+            )
+        ],
+        [InlineKeyboardButton(text="🔙 Back to Running Hub", callback_data="admin_running_queues")]
+    ]
+
+    detail_card = (
+        f"🚀 <b>Queue Scheduler:</b> <code>{q['name']}</code>\n\n"
+        f"• <b>Status:</b> {status_str}\n"
+        f"• <b>Stored Posts:</b> <code>{post_count}</code>\n"
+        f"• <b>Destination Channel:</b> <b>{dest_str}</b>\n"
+        f"• <b>Playback Order:</b> <code>{mode.capitalize()}</code>\n"
+        f"• <b>Delay Type:</b> <code>{delay_str}</code>\n"
+        f"• <b>Lifetime Runs:</b> <code>{q['run_count']}</code>\n\n"
+        "Configure settings above and tap <b>Start Sending Queue</b>."
+    )
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, detail_card, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data == "admin_running_queues")
+async def admin_running_queues(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        queues = await conn.fetch("SELECT id, name, run_count FROM queues ORDER BY id ASC")
+
+    if not queues:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_hub")]])
+        await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "🚀 <b>Running Queues Hub</b>\n\nNo queues created yet.", reply_markup=kb)
+        return
+
+    buttons = []
+    text_lines = ["🚀 <b>Running Queues Control Hub:</b>\n"]
+
+    for q in queues:
+        qid = q["id"]
+        qname = q["name"]
+        is_running = qid in active_tasks and not active_tasks[qid].done()
+        status_symbol = "🟢 Running" if is_running else "⚪ Idle"
+        text_lines.append(f"• <b>{qname}</b> — {status_symbol} (Runs: {q['run_count']})")
+        buttons.append([InlineKeyboardButton(text=f"⚙️ Schedule/Control: {qname} ({status_symbol})", callback_data=f"run_hub_q:{qid}")])
+
+    buttons.append([InlineKeyboardButton(text="🔙 Back to Manage Hub", callback_data="admin_manage_hub")])
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "\n".join(text_lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("run_hub_q:"))
+async def admin_run_hub_detail(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+    await render_run_hub_detail(callback, queue_id)
+
+
+@router.callback_query(F.data.startswith("set_mode_hub:"))
+async def admin_set_mode_hub(callback: CallbackQuery):
+    await callback.answer("Mode updated")
+    if callback.from_user.id != get_admin_id():
+        return
+    _, qid_str, new_mode = callback.data.split(":")
+    queue_id = int(qid_str)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE queues SET mode = $1 WHERE id = $2", new_mode, queue_id)
+
+    await render_run_hub_detail(callback, queue_id)
+
+
+@router.callback_query(F.data.startswith("toggle_run_hub:"))
+async def admin_toggle_run_hub(callback: CallbackQuery, bot: Bot):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+
+    if queue_id in active_tasks and not active_tasks[queue_id].done():
+        active_tasks[queue_id].cancel()
+        del active_tasks[queue_id]
+        live_broadcast_stats.pop(queue_id, None)
+        await callback.answer("Broadcast stopped.", show_alert=True)
+    else:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            q = await conn.fetchrow("SELECT destination FROM queues WHERE id = $1", queue_id)
+            unmatured_exists = await conn.fetchval(
+                "SELECT 1 FROM destinations WHERE assigned_queue_id = $1 LIMIT 1", queue_id
+            )
+            post_count = await conn.fetchval("SELECT COUNT(*) FROM posts WHERE queue_id = $1", queue_id)
+
+        if not q or (not q["destination"] and not unmatured_exists):
+            await callback.answer("⚠️ No broadcast destination attached!", show_alert=True)
+            return
+        if post_count == 0:
+            await callback.answer("⚠️ Queue is empty! No posts to send.", show_alert=True)
+            return
+
+        task = asyncio.create_task(broadcast_worker(bot, queue_id))
+        active_tasks[queue_id] = task
+        await callback.answer("🚀 Broadcast launched!", show_alert=True)
+
+    await render_run_hub_detail(callback, queue_id)
+
+
+@router.callback_query(F.data.startswith("q_pick_dest:"))
+async def admin_q_pick_dest(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        destinations = await conn.fetch("SELECT chat_id, title FROM destinations ORDER BY title ASC")
+
+    if not destinations:
+        await callback.answer("No destinations found. Add one with /addest first!", show_alert=True)
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=f"📡 {d['title'] or d['chat_id']}", callback_data=f"q_apply_dest:{queue_id}:{d['chat_id']}")]
+        for d in destinations
+    ]
+    buttons.append([InlineKeyboardButton(text="❌ Detach Destination", callback_data=f"q_apply_dest:{queue_id}:none")])
+    buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data=f"run_hub_q:{queue_id}")])
+
+    await safe_edit_message(
+        callback.message.bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+        "🎯 <b>Select Destination for Broadcast:</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+@router.callback_query(F.data.startswith("q_apply_dest:"))
+async def admin_q_apply_dest(callback: CallbackQuery):
+    await callback.answer("Destination updated!")
+    if callback.from_user.id != get_admin_id():
+        return
+    parts = callback.data.split(":")
+    queue_id = int(parts[1])
+    dest_id = parts[2]
+    dest_val = None if dest_id == "none" else dest_id
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE queues SET destination = $1 WHERE id = $2", dest_val, queue_id)
+
+    await render_run_hub_detail(callback, queue_id)
+
+
+# ==================== DELAY CONFIGURATION ====================
+
+@router.callback_query(F.data.startswith("open_delay_menu:"))
+async def admin_open_delay_menu(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+
+    buttons = [
+        [InlineKeyboardButton(text="⏱ Set Fixed Delay (e.g. 15s)", callback_data=f"set_fixed_prompt:{queue_id}")],
+        [InlineKeyboardButton(text="🎲 Set Random Delay Range (e.g. 10s - 30s)", callback_data=f"set_random_prompt:{queue_id}")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"run_hub_q:{queue_id}")]
+    ]
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "⏱ <b>Select Delay Configuration:</b>\n\n• <b>Fixed Delay:</b> Constant interval between posts.\n• <b>Random Delay Range:</b> Picks random interval between min and max seconds.", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("set_fixed_prompt:"))
+async def admin_set_fixed_prompt(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+    await state.update_data(current_queue_id=queue_id)
+    await state.set_state(AdminStates.waiting_for_fixed_delay)
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "⏱ <b>Set Fixed Delay:</b>\n\nSend delay in seconds (e.g. <code>15</code>):")
+
+
+@router.message(AdminStates.waiting_for_fixed_delay, F.text)
+async def admin_set_fixed_save(message: Message, state: FSMContext):
+    if message.from_user.id != get_admin_id():
+        return
+    val = message.text.strip()
+    if not val.isdigit() or int(val) < 1:
+        await message.answer("⚠️ Please enter a valid number of seconds (1 or higher).")
+        return
+
+    delay = int(val)
+    data = await state.get_data()
+    queue_id = data["current_queue_id"]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE queues SET delay_sec = $1, delay_type = 'fixed' WHERE id = $2",
+            delay, queue_id
+        )
+
+    await state.clear()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Queue Scheduler", callback_data=f"run_hub_q:{queue_id}")]]
+    )
+    await message.answer(f"✅ Fixed delay updated to <code>{delay}</code> seconds.", parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("set_random_prompt:"))
+async def admin_set_random_prompt(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+    await state.update_data(current_queue_id=queue_id)
+    await state.set_state(AdminStates.waiting_for_random_delay)
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "🎲 <b>Set Random Delay Range:</b>\n\nSend minimum and maximum seconds separated by dash/space (e.g. <code>10-30</code>):")
+
+
+@router.message(AdminStates.waiting_for_random_delay, F.text)
+async def admin_set_random_save(message: Message, state: FSMContext):
+    if message.from_user.id != get_admin_id():
+        return
+    raw = message.text.strip().replace("-", " ").split()
+    if len(raw) != 2 or not raw[0].isdigit() or not raw[1].isdigit():
+        await message.answer("⚠️ Invalid format. Example: <code>10-30</code> or <code>10 30</code>.")
+        return
+
+    min_d = int(raw[0])
+    max_d = int(raw[1])
+    if min_d < 1 or max_d < min_d:
+        await message.answer("⚠️ Minimum must be at least 1 and Maximum must be >= Minimum.")
+        return
+
+    data = await state.get_data()
+    queue_id = data["current_queue_id"]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE queues SET delay_min = $1, delay_max = $2, delay_type = 'random' WHERE id = $3",
+            min_d, max_d, queue_id
+        )
+
+    await state.clear()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Queue Scheduler", callback_data=f"run_hub_q:{queue_id}")]]
+    )
+    await message.answer(f"✅ Random delay range set to <code>{min_d}s - {max_d}s</code>.", parse_mode="HTML", reply_markup=kb)
+
+
+# ==================== DESTINATIONS DASHBOARD ====================
+
+@router.callback_query(F.data == "admin_view_destinations")
+async def admin_view_destinations(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        destinations = await conn.fetch("SELECT * FROM destinations ORDER BY title ASC")
+        queues = await conn.fetch("SELECT id, name, destination FROM queues")
+        master_log = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
+
+    total_count = len(destinations)
+    buttons = []
+    text = (
+        f"📡 <b>Connected Destinations ({total_count} Active):</b>\n\n"
+        "💡 <b>Quick Add:</b> Send <code>/addest NickName numerical_id</code> to register immediately.\n\n"
+    )
+
+    for d in destinations:
+        cid = d["chat_id"]
+        title = d["title"]
+        ctype = d["chat_type"]
+        is_unmatured = d["is_unmatured"]
+        accept_requests = d["accept_requests"]
+
+        assigned_targets = [q["name"] for q in queues if q["destination"] == cid]
+        is_master = (cid == master_log)
+
+        status_tags = []
+        if is_master:
+            status_tags.append("MASTER LOG")
+        if is_unmatured:
+            status_tags.append("UNMATURED")
+        if assigned_targets:
+            status_tags.append(f"Target: {', '.join(assigned_targets)}")
+        if accept_requests:
+            status_tags.append("Accepting Joins 🟢")
+
+        status_str = f" — [{', '.join(status_tags)}]" if status_tags else " — [Unassigned]"
+        text += f"• <b>{title}</b> ({ctype.capitalize()})\n  ID: <code>{cid}</code>{status_str}\n\n"
+        buttons.append([InlineKeyboardButton(text=f"⚙️ Manage: {title}", callback_data=f"dest_actions:{cid}")])
+
+    buttons.append([InlineKeyboardButton(text="🔙 Back to Admin Panel", callback_data="admin_back")])
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+async def render_dest_actions(callback: CallbackQuery, chat_id: str):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        dest = await conn.fetchrow("SELECT * FROM destinations WHERE chat_id = $1", chat_id)
+        assigned_qname = None
+        if dest and dest["assigned_queue_id"]:
+            q_row = await conn.fetchrow("SELECT name FROM queues WHERE id = $1", dest["assigned_queue_id"])
+            assigned_qname = q_row["name"] if q_row else None
+        pending_joins = await conn.fetchval(
+            "SELECT COUNT(*) FROM join_requests WHERE chat_id = $1 AND status = 'pending'", chat_id
+        )
+        total_joins = await conn.fetchval(
+            "SELECT COUNT(*) FROM join_requests WHERE chat_id = $1", chat_id
+        )
+
+    if not dest:
+        await callback.answer("Destination not found.", show_alert=True)
+        return
+
+    title = dest["title"]
+    is_unmatured = dest["is_unmatured"]
+    accept_requests = dest["accept_requests"]
+    join_min = dest["join_delay_min"] or 3
+    join_max = dest["join_delay_max"] or 10
+    total_acc = dest["total_accepted"] or 0
+    delivered = dest["posts_delivered"] or 0
+
+    buttons = [
+        [InlineKeyboardButton(text="🎯 Set as Broadcast Destination", callback_data=f"dest_assign_broadcast:{chat_id}")],
+        [InlineKeyboardButton(text="📋 Set as Master Log Destination", callback_data=f"dest_set_master:{chat_id}")],
+        [InlineKeyboardButton(text="⚪ Set as Unmatured Destination", callback_data=f"dest_set_unmatured:{chat_id}")]
+    ]
+
+    join_status_label = "⏹ Stop Accepting Requests" if accept_requests else "▶️ Start Accepting Requests"
+    buttons.append([InlineKeyboardButton(text=join_status_label, callback_data=f"dest_toggle_accept:{chat_id}")])
+    buttons.append([InlineKeyboardButton(text=f"⏱ Join Delay: {join_min}s - {join_max}s", callback_data=f"dest_prompt_join_delay:{chat_id}")])
+
+    if is_unmatured:
+        q_label = f"📁 Broadcast Queue: {assigned_qname or 'None'}"
+        buttons.append([InlineKeyboardButton(text=q_label, callback_data=f"unmatured_bind_q:{chat_id}")])
+        buttons.append([InlineKeyboardButton(text="🔄 Convert to Broadcast Destination", callback_data=f"unmatured_convert_broadcast:{chat_id}")])
+
+    buttons.append([InlineKeyboardButton(text="🔙 Back to Destinations", callback_data="admin_view_destinations")])
+
+    status_tag = "Unmatured" if is_unmatured else "Regular Broadcast"
+    card = (
+        f"⚙️ <b>Destination:</b> <b>{title}</b> (<code>{chat_id}</code>)\n\n"
+        f"• <b>Status:</b> <code>{status_tag}</code>\n"
+        f"• <b>Posts Delivered (Health):</b> <code>{delivered}</code>\n"
+        f"• <b>Join Requests Auto-Accept:</b> {'🟢 Running' if accept_requests else '⚪ Paused'}\n"
+        f"• <b>Requests:</b> <code>{total_joins - pending_joins} / {total_joins}</code> approved (<b>{pending_joins} pending</b>)\n"
+        f"• <b>Random Join Delay:</b> <code>{join_min}s - {join_max}s</code>\n"
+        + (f"• <b>Assigned Broadcast Queue:</b> <code>{assigned_qname or 'None'}</code>\n" if is_unmatured else "")
+    )
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, card, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("dest_actions:"))
+async def admin_dest_actions(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    chat_id = callback.data.split(":")[1]
+    await render_dest_actions(callback, chat_id)
+
+
+@router.callback_query(F.data.startswith("dest_toggle_accept:"))
+async def admin_dest_toggle_accept(callback: CallbackQuery, bot: Bot):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    chat_id = callback.data.split(":")[1]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        curr = await conn.fetchval("SELECT accept_requests FROM destinations WHERE chat_id = $1", chat_id)
+        new_state = not curr
+        await conn.execute("UPDATE destinations SET accept_requests = $1 WHERE chat_id = $2", new_state, chat_id)
+
+    if new_state:
+        if chat_id not in active_join_tasks or active_join_tasks[chat_id].done():
+            task = asyncio.create_task(join_request_worker(bot, chat_id))
+            active_join_tasks[chat_id] = task
+        await callback.answer("🟢 Auto-accepting join requests started!", show_alert=True)
+    else:
+        if chat_id in active_join_tasks:
+            active_join_tasks[chat_id].cancel()
+            del active_join_tasks[chat_id]
+        await callback.answer("⏹ Auto-accepting join requests paused.", show_alert=True)
+
+    await render_dest_actions(callback, chat_id)
+
+
+@router.callback_query(F.data.startswith("dest_prompt_join_delay:"))
+async def admin_dest_prompt_join_delay(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    chat_id = callback.data.split(":")[1]
+    await state.update_data(current_join_chat_id=chat_id)
+    await state.set_state(AdminStates.waiting_for_join_delay)
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "🎲 <b>Set Random Join Delay Range:</b>\n\nSend min and max seconds separated by a dash (e.g. <code>3-10</code>):")
+
+
+@router.message(AdminStates.waiting_for_join_delay, F.text)
+async def admin_dest_save_join_delay(message: Message, state: FSMContext):
+    if message.from_user.id != get_admin_id():
+        return
+    raw = message.text.strip().replace("-", " ").split()
+    if len(raw) != 2 or not raw[0].isdigit() or not raw[1].isdigit():
+        await message.answer("⚠️ Invalid format. Example: <code>3-10</code> or <code>5 15</code>.")
+        return
+
+    min_d = int(raw[0])
+    max_d = int(raw[1])
+    if min_d < 1 or max_d < min_d:
+        await message.answer("⚠️ Minimum must be >= 1 and Maximum must be >= Minimum.")
+        return
+
+    data = await state.get_data()
+    chat_id = data["current_join_chat_id"]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE destinations SET join_delay_min = $1, join_delay_max = $2 WHERE chat_id = $3",
+            min_d, max_d, chat_id
+        )
+
+    await state.clear()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Destination", callback_data=f"dest_actions:{chat_id}")]]
+    )
+    await message.answer(f"✅ Random join delay set to <code>{min_d}s - {max_d}s</code>.", parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("unmatured_bind_q:"))
+async def admin_unmatured_bind_q(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    chat_id = callback.data.split(":")[1]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        queues = await conn.fetch("SELECT id, name FROM queues ORDER BY id ASC")
+
+    buttons = [
+        [InlineKeyboardButton(text=f"📁 Broadcast: {q['name']}", callback_data=f"unmatured_apply_q:{chat_id}:{q['id']}")]
+        for q in queues
+    ]
+    buttons.append([InlineKeyboardButton(text="❌ Detach Queue", callback_data=f"unmatured_apply_q:{chat_id}:0")])
+    buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data=f"dest_actions:{chat_id}")])
+
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "Choose which queue should also broadcast to this Unmatured Destination:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("unmatured_apply_q:"))
+async def admin_unmatured_apply_q(callback: CallbackQuery):
+    await callback.answer("Updated broadcast queue")
+    if callback.from_user.id != get_admin_id():
+        return
+    _, chat_id, qid_str = callback.data.split(":")
+    qid = int(qid_str)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if qid == 0:
+            await conn.execute("UPDATE destinations SET assigned_queue_id = NULL WHERE chat_id = $1", chat_id)
+        else:
+            await conn.execute("UPDATE destinations SET assigned_queue_id = $1 WHERE chat_id = $2", qid, chat_id)
+
+    await render_dest_actions(callback, chat_id)
+
+
+@router.callback_query(F.data.startswith("unmatured_convert_broadcast:"))
+async def admin_unmatured_convert_broadcast(callback: CallbackQuery, bot: Bot):
+    await callback.answer("Converting destination...")
+    if callback.from_user.id != get_admin_id():
+        return
+    chat_id = callback.data.split(":")[1]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        dest = await conn.fetchrow("SELECT title, assigned_queue_id FROM destinations WHERE chat_id = $1", chat_id)
+        await conn.execute(
+            """
+            UPDATE destinations 
+            SET is_unmatured = FALSE, accept_requests = TRUE, join_delay_min = 3, join_delay_max = 8 
+            WHERE chat_id = $1
+            """,
+            chat_id
+        )
+
+        if dest and dest["assigned_queue_id"]:
+            await conn.execute(
+                "UPDATE queues SET destination = $1 WHERE id = $2", chat_id, dest["assigned_queue_id"]
+            )
+
+    if chat_id not in active_join_tasks or active_join_tasks[chat_id].done():
+        task = asyncio.create_task(join_request_worker(bot, chat_id))
+        active_join_tasks[chat_id] = task
+
+    await render_dest_actions(callback, chat_id)
+
+
+@router.callback_query(F.data.startswith("dest_assign_broadcast:"))
+async def admin_dest_assign_broadcast(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    chat_id = callback.data.split(":")[1]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        queues = await conn.fetch("SELECT id, name FROM queues ORDER BY id ASC")
+
+    if not queues:
+        await callback.answer("⚠️ No queues found. Create a queue first!", show_alert=True)
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=f"📁 Assign to: {q['name']}", callback_data=f"confirm_broadcast_bind:{chat_id}:{q['id']}")]
+        for q in queues
+    ]
+    buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data=f"dest_actions:{chat_id}")])
+
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "Select which queue will broadcast to this destination:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("confirm_broadcast_bind:"))
+async def admin_confirm_broadcast_bind(callback: CallbackQuery):
+    await callback.answer("Bound!")
+    if callback.from_user.id != get_admin_id():
+        return
+    _, chat_id, qid_str = callback.data.split(":")
+    queue_id = int(qid_str)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE queues SET destination = $1 WHERE id = $2", chat_id, queue_id)
+        await conn.execute("UPDATE destinations SET is_unmatured = FALSE WHERE chat_id = $1", chat_id)
+
+    await render_dest_actions(callback, chat_id)
+
+
+@router.callback_query(F.data.startswith("dest_set_master:"))
+async def admin_dest_set_master(callback: CallbackQuery, bot: Bot):
+    await callback.answer("Set as master log!")
+    if callback.from_user.id != get_admin_id():
+        return
+    chat_id = callback.data.split(":")[1]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO bot_settings (key, value)
+            VALUES ('master_log_chat_id', $1)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            chat_id
+        )
+
+    await dispatch_notification(bot, "📋 <b>Channel Assigned as Master Log Destination</b>")
+    await render_dest_actions(callback, chat_id)
+
+
+@router.callback_query(F.data.startswith("dest_set_unmatured:"))
+async def admin_dest_set_unmatured(callback: CallbackQuery):
+    await callback.answer("Marked unmatured")
+    if callback.from_user.id != get_admin_id():
+        return
+    chat_id = callback.data.split(":")[1]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE queues SET destination = NULL WHERE destination = $1", chat_id)
+        await conn.execute("DELETE FROM bot_settings WHERE key = 'master_log_chat_id' AND value = $1", chat_id)
+        await conn.execute("UPDATE destinations SET is_unmatured = TRUE WHERE chat_id = $1", chat_id)
+
+    await render_dest_actions(callback, chat_id)
+
+
+# ==================== ADMIN STATE HANDLERS ====================
+
+@router.message(AdminStates.waiting_for_queue_name, F.text)
+async def admin_create_queue_save(message: Message, state: FSMContext, bot: Bot):
+    if message.from_user.id != get_admin_id():
+        return
+
+    if message.text.strip() == "/cancel":
+        await state.clear()
+        kb = await get_admin_main_kb()
+        await message.answer("❌ Queue creation cancelled.", reply_markup=kb)
+        return
+
+    queue_name = message.text.strip()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            new_id = await conn.fetchval(
+                "INSERT INTO queues (name, delay_sec, delay_min, delay_max, delay_type, mode, run_count) VALUES ($1, 5, 5, 15, 'fixed', 'sequence', 0) RETURNING id",
+                queue_name
+            )
+
+            await dispatch_notification(
+                bot,
+                f"📁 <b>New Queue Established</b>\n"
+                f"• <b>Name:</b> <code>{queue_name}</code>\n"
+                f"• <b>Queue ID:</b> <code>{new_id}</code>",
+                queue_id=new_id
+            )
+
+            await state.clear()
+            confirm_kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🚀 Open in Running Hub", callback_data=f"run_hub_q:{new_id}")],
+                    [InlineKeyboardButton(text="🔙 Back to Admin Menu", callback_data="admin_back")]
+                ]
+            )
+
+            confirmation_card = (
+                "✅ <b>Queue Created Successfully!</b>\n\n"
+                f"• <b>Queue Name:</b> <code>{queue_name}</code>\n"
+                f"• <b>Queue ID:</b> <code>{new_id}</code>\n"
+                f"• <b>Destination:</b> <i>Not configured</i>\n\n"
+                "Tap below to schedule it in the Running Hub or assign a destination."
+            )
+            await message.answer(confirmation_card, parse_mode="HTML", reply_markup=confirm_kb)
+
+        except Exception:
+            kb = await get_admin_main_kb()
+            await message.answer(
+                f"❌ <b>Error:</b> A queue named <code>{queue_name}</code> already exists. Please choose a different name.",
+                parse_mode="HTML",
+                reply_markup=kb
+            )
+            await state.clear()
+
+
+@router.message(AdminStates.waiting_for_destination_manual, F.text)
+async def admin_set_dest_manual_save(message: Message, state: FSMContext, bot: Bot):
+    if message.from_user.id != get_admin_id():
+        return
+    data = await state.get_data()
+    queue_id = data["current_queue_id"]
+    dest = message.text.strip()
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE queues SET destination = $1 WHERE id = $2", dest, queue_id)
+
+    await dispatch_notification(
+        bot,
+        f"⚙️ <b>Queue Destination Updated:</b> Broadcast target set to <code>{dest}</code>",
+        queue_id=queue_id
+    )
+    await state.clear()
+    kb = await get_admin_main_kb()
+    await message.answer(f"✅ Target destination set to <code>{dest}</code>.", parse_mode="HTML", reply_markup=kb)
+
+
+@router.message(AdminStates.waiting_for_master_log_manual, F.text)
+async def admin_master_log_manual_save(message: Message, state: FSMContext, bot: Bot):
+    if message.from_user.id != get_admin_id():
+        return
+    target = message.text.strip()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO bot_settings (key, value)
+            VALUES ('master_log_chat_id', $1)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            target
+        )
+
+    await state.clear()
+    await dispatch_notification(
+        bot,
+        f"📋 <b>Master Log Destination Configured:</b> Linked to <code>{target}</code>."
+    )
+    kb = await get_admin_main_kb()
+    await message.answer(f"✅ Master log destination saved as <code>{target}</code>.", parse_mode="HTML", reply_markup=kb)
+
+
+@router.message(AdminStates.waiting_for_uploader_id, F.text)
+async def admin_uploader_id_received(message: Message, state: FSMContext):
+    if message.from_user.id != get_admin_id():
+        return
+    val = message.text.strip()
+    if not val.isdigit():
+        await message.answer("⚠️ Please provide a valid numeric User ID.")
+        return
+
+    await state.update_data(new_uploader_user_id=int(val))
+    await state.set_state(AdminStates.waiting_for_uploader_name)
+    await message.answer("🏷 Enter a label/name for this uploader (or type <code>Flezen uploader</code>):", parse_mode="HTML")
+
+
+@router.message(AdminStates.waiting_for_uploader_name, F.text)
+async def admin_uploader_name_received(message: Message, state: FSMContext, bot: Bot):
+    if message.from_user.id != get_admin_id():
+        return
+    alias = message.text.strip() or "Flezen uploader"
+    data = await state.get_data()
+    uid = data["new_uploader_user_id"]
+    qid = data["new_uploader_queue_id"]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO uploaders (user_id, name, queue_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT(user_id) DO UPDATE SET name = EXCLUDED.name, queue_id = EXCLUDED.queue_id
+            """,
+            uid, alias, qid
+        )
+        q_row = await conn.fetchrow("SELECT name FROM queues WHERE id = $1", qid)
+        q_name = q_row["name"] if q_row else "Queue"
+
+    await dispatch_notification(
+        bot,
+        f"👤 <b>Flezen Uploader Configured</b>\n• <b>Name:</b> {alias}\n• <b>User ID:</b> <code>{uid}</code>\n• <b>Assigned Queue:</b> <code>{q_name}</code>",
+        queue_id=qid
+    )
+
+    try:
+        await bot.send_message(
+            chat_id=uid,
+            text=f"🎉 You have been added as a <b>{alias}</b> for queue <code>{q_name}</code>. You can start uploading directly anytime!",
+            parse_mode="HTML",
+            reply_markup=get_user_main_kb()
+        )
+    except Exception:
+        pass
+
+    await state.clear()
+    kb = await get_admin_main_kb()
+    await message.answer(
+        f"✅ <b>{alias}</b> (<code>{uid}</code>) assigned to queue <b>{q_name}</b>.",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+# ==================== MASTER LOG CONFIGURATION ====================
+
+@router.callback_query(F.data == "admin_set_master_log_screen")
+async def admin_set_master_log_screen(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        detected = await conn.fetch("SELECT chat_id, title, chat_type FROM destinations ORDER BY title ASC")
+        current_master = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
+
+    current_str = f"<code>{current_master}</code>" if current_master else "<i>Not Set</i>"
+    buttons = []
+    for row in detected:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"📢 Set to: {row['title']} ({row['chat_type'].capitalize()})",
+                callback_data=f"apply_master_log:{row['chat_id']}"
+            )
+        ])
+
+    buttons.append([InlineKeyboardButton(text="✏️ Enter ID/Username Manually", callback_data="admin_master_log_manual")])
+    if current_master:
+        buttons.append([InlineKeyboardButton(text="🗑 Unset Master Log", callback_data="admin_clear_master_log")])
+    buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")])
+
+    text = (
+        "📋 <b>Master Log Channel Configuration</b>\n\n"
+        f"• <b>Current Master Log:</b> {current_str}\n\n"
+        "All progress updates and queue reports stream here."
+    )
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("apply_master_log:"))
+async def admin_apply_master_log(callback: CallbackQuery, bot: Bot):
+    await callback.answer("Master log updated")
+    if callback.from_user.id != get_admin_id():
+        return
+    chat_id = callback.data.split(":")[1]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO bot_settings (key, value)
+            VALUES ('master_log_chat_id', $1)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            chat_id
+        )
+
+    await dispatch_notification(
+        bot,
+        "📋 <b>Master Log Destination Activated:</b> All live reports will post here."
+    )
+    await admin_set_master_log_screen(callback)
+
+
+@router.callback_query(F.data == "admin_clear_master_log")
+async def admin_clear_master_log(callback: CallbackQuery):
+    await callback.answer("Removed")
+    if callback.from_user.id != get_admin_id():
+        return
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM bot_settings WHERE key = 'master_log_chat_id'")
+
+    await admin_set_master_log_screen(callback)
+
+
+@router.callback_query(F.data == "admin_master_log_manual")
+async def admin_master_log_manual_prompt(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    await state.set_state(AdminStates.waiting_for_master_log_manual)
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "📋 <b>Enter Master Log Destination:</b>\nSend `@channel_username` or numeric chat ID (`-100...`):")
+
+
+# ==================== USER HANDLERS & ACCESS REQUESTS ====================
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    user = message.from_user
+    current_admin = get_admin_id()
+    
+    if user.id == current_admin:
+        kb = await get_admin_main_kb()
+        await message.answer(
+            "👋 <b>Welcome Admin</b>. Use /admin to access the control panel.",
+            parse_mode="HTML",
+            reply_markup=kb
+        )
+        return
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        uploader = await conn.fetchrow(
+            """
+            SELECT u.name, q.name AS q_name 
+            FROM uploaders u 
+            LEFT JOIN queues q ON u.queue_id = q.id 
+            WHERE u.user_id = $1
+            """,
+            user.id
+        )
+
+    if uploader and uploader["q_name"]:
+        await message.answer(
+            f"👋 <b>Welcome back, {uploader['name']}!</b>\n"
+            f"📁 <b>Assigned Queue:</b> <code>{uploader['q_name']}</code>\n\n"
+            "💡 <b>Auto-detect & Deduplication Enabled:</b> Send posts/media directly anytime. Duplicates will be skipped automatically!",
+            parse_mode="HTML",
+            reply_markup=get_user_main_kb()
+        )
+    else:
+        await message.answer(
+            "🔒 <b>Access Restricted</b>\n\n"
+            "Your account is not yet authorized. An access request has been sent to the administrator.",
+            parse_mode="HTML"
+        )
+        
+        user_mention = f"@{user.username}" if user.username else user.full_name
+        req_text = (
+            "🚨 <b>New Access Request</b>\n\n"
+            f"• <b>User:</b> {user.full_name} ({user_mention})\n"
+            f"• <b>User ID:</b> <code>{user.id}</code>\n\n"
+            "Click below to select a queue and grant access."
+        )
+
+        await dispatch_notification(bot, req_text)
+
+        if current_admin:
+            grant_kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Grant Access as Flezen Uploader", callback_data=f"grant_req:{user.id}")]
+                ]
+            )
+            await safe_send_message(bot, current_admin, req_text)
+
+
+@router.callback_query(F.data.startswith("grant_req:"))
+async def admin_grant_request(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    user_id = int(callback.data.split(":")[1])
+    await state.update_data(new_uploader_user_id=user_id)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        queues = await conn.fetch("SELECT id, name FROM queues ORDER BY id ASC")
+
+    if not queues:
+        await callback.answer("⚠️ Create at least one queue first!", show_alert=True)
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=f"📁 {row['name']}", callback_data=f"auto_grant_assign:{row['id']}")]
+        for row in queues
+    ]
+    buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")])
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, f"Select the queue to grant user <code>{user_id}</code> access to:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("auto_grant_assign:"))
+async def admin_auto_grant_finish(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer("Access granted!")
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+    data = await state.get_data()
+    user_id = data["new_uploader_user_id"]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO uploaders (user_id, name, queue_id)
+            VALUES ($1, 'Flezen uploader', $2)
+            ON CONFLICT(user_id) DO UPDATE SET queue_id = EXCLUDED.queue_id
+            """,
+            user_id, queue_id
+        )
+        q_row = await conn.fetchrow("SELECT name FROM queues WHERE id = $1", queue_id)
+        q_name = q_row["name"] if q_row else "Queue"
+
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                f"🎉 <b>Access Approved!</b>\n\n"
+                f"You are now registered as a <b>Flezen uploader</b> for queue: <code>{q_name}</code>.\n"
+                "You can directly upload posts/media into this chat at any time!"
+            ),
+            parse_mode="HTML",
+            reply_markup=get_user_main_kb()
+        )
+    except Exception:
+        pass
+
+    await dispatch_notification(
+        bot,
+        f"👤 <b>New Flezen Uploader Approved</b>\n• User: <code>{user_id}</code>\n• Queue: <code>{q_name}</code>",
+        queue_id=queue_id
+    )
+
+    await state.clear()
+    kb = await get_admin_main_kb()
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, f"✅ Access granted to user <code>{user_id}</code> for queue <b>{q_name}</b>.", reply_markup=kb)
+
+
+# ==================== CHECK STATS ====================
+
+@router.message(F.text == "📊 Check Stats")
+async def user_stats_handler(message: Message):
+    user_id = message.from_user.id
+    now = datetime.utcnow()
+    
+    day_ago = now - timedelta(days=1)
+    week_ago = now - timedelta(days=7)
+    month_ago = now - timedelta(days=30)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        day_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_logs WHERE user_id = $1 AND is_duplicate = FALSE AND created_at >= $2",
+            user_id, day_ago
+        )
+        week_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_logs WHERE user_id = $1 AND is_duplicate = FALSE AND created_at >= $2",
+            user_id, week_ago
+        )
+        month_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_logs WHERE user_id = $1 AND is_duplicate = FALSE AND created_at >= $2",
+            user_id, month_ago
+        )
+
+        day_dups = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_logs WHERE user_id = $1 AND is_duplicate = TRUE AND created_at >= $2",
+            user_id, day_ago
+        )
+        week_dups = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_logs WHERE user_id = $1 AND is_duplicate = TRUE AND created_at >= $2",
+            user_id, week_ago
+        )
+        month_dups = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_logs WHERE user_id = $1 AND is_duplicate = TRUE AND created_at >= $2",
+            user_id, month_ago
+        )
+
+    stats_text = (
+        "📊 <b>Your Upload Statistics:</b>\n\n"
+        f"• <b>Past 24 Hours:</b> <code>{day_count}</code> posts"
+        + (f" <i>(⚠️ Duplicates: {day_dups})</i>\n" if day_dups > 0 else "\n")
+        + f"• <b>Past 7 Days:</b> <code>{week_count}</code> posts"
+        + (f" <i>(⚠️ Duplicates: {week_dups})</i>\n" if week_dups > 0 else "\n")
+        + f"• <b>Past 30 Days:</b> <code>{month_count}</code> posts"
+        + (f" <i>(⚠️ Duplicates: {month_dups})</i>" if month_dups > 0 else "")
+    )
+    await message.answer(stats_text, parse_mode="HTML")
+
+
+@router.message(F.text == "🚀 Start Task")
+async def user_start_task(message: Message):
+    user_id = message.from_user.id
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT q.name AS q_name, u.name AS u_name 
+            FROM uploaders u 
+            JOIN queues q ON u.queue_id = q.id 
+            WHERE u.user_id = $1
+            """,
+            user_id
+        )
+
+    if not row:
+        await message.answer(
+            "⚠️ You haven't been assigned to an active queue yet. Please contact the administrator.",
+            reply_markup=get_user_main_kb()
+        )
+        return
+
+    queue_name, uploader_alias = row["q_name"], row["u_name"]
+    await message.answer(
+        f"📥 <b>Uploader Profile:</b> <code>{uploader_alias}</code>\n"
+        f"📁 <b>Connected Queue:</b> <code>{queue_name}</code>\n\n"
+        "Send your posts (text, photos, albums, videos, files) anytime.\n"
+        "• Automatic duplicate detection is active.",
+        parse_mode="HTML",
+        reply_markup=get_user_main_kb()
+    )
+
+
+# ==================== FINISH UPLOAD SUMMARY ====================
+
+@router.message(F.text.in_(["⏹ Finish Uploading", "⏹ Completed Uploading"]))
+async def user_finish_uploading(message: Message, bot: Bot):
+    user_id = message.from_user.id
+
+    session_queued = 0
+    session_dups = 0
+    session = upload_batches.get(user_id)
+    if session:
+        session_queued = session.queued_count
+        session_dups = session.duplicate_count
+        if session.debounce_task and not session.debounce_task.done():
+            session.debounce_task.cancel()
+        await session._update_ui(is_final=True)
+
+    now = datetime.utcnow()
+    start_of_today = datetime(now.year, now.month, now.day)
+    start_of_month = datetime(now.year, now.month, 1)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT u.name AS u_name, u.queue_id, q.name AS q_name 
+            FROM uploaders u 
+            JOIN queues q ON u.queue_id = q.id 
+            WHERE u.user_id = $1
+            """,
+            user_id
+        )
+
+        today_valid = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_logs WHERE user_id = $1 AND is_duplicate = FALSE AND created_at >= $2",
+            user_id, start_of_today
+        )
+        today_dups = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_logs WHERE user_id = $1 AND is_duplicate = TRUE AND created_at >= $2",
+            user_id, start_of_today
+        )
+        month_valid = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_logs WHERE user_id = $1 AND is_duplicate = FALSE AND created_at >= $2",
+            user_id, start_of_month
+        )
+
+    if not row:
+        await message.answer("⚠️ No active queue found for your profile.", reply_markup=get_user_main_kb())
+        return
+
+    uploader_name = row["u_name"]
+    qid = row["queue_id"]
+    qname = row["q_name"]
+
+    dup_summary = f"• <b>Duplicates Skipped:</b> <code>{session_dups}</code>\n" if session_dups > 0 else ""
+
+    summary_text = (
+        "🏁 <b>Upload Session Completed!</b>\n\n"
+        f"• <b>Session New Uploads:</b> <code>{session_queued}</code> post(s)\n"
+        f"{dup_summary}"
+        f"• <b>Today's Total Uploads:</b> <code>{today_valid}</code> post(s)\n"
+        f"• <b>Today's Total Duplicate Uploads:</b> <code>{today_dups}</code>\n"
+        f"• <b>This Month's Total Uploads:</b> <code>{month_valid}</code> post(s)\n\n"
+        f"<i>Saved in queue <b>{qname}</b>.</i>"
+    )
+    await message.answer(summary_text, parse_mode="HTML", reply_markup=get_user_main_kb())
+
+    await dispatch_notification(
+        bot,
+        f"⏹ <b>Flezen Uploader Finished Uploading</b>\n\n"
+        f"• <b>Uploader:</b> {uploader_name} (<code>{user_id}</code>)\n"
+        f"• <b>Queue:</b> <code>{qname}</code>\n"
+        f"• <b>Session New Posts:</b> <code>{session_queued}</code>\n"
+        f"• <b>Today's Valid Uploads:</b> <code>{today_valid}</code>\n"
+        f"• <b>Today's Duplicate Uploads:</b> <code>{today_dups}</code>\n"
+        f"• <b>Month's Total Uploads:</b> <code>{month_valid}</code>",
+        queue_id=qid
+    )
+
+
+# ==================== AUTO-DETECT INCOMING POSTS ====================
+
+@router.message(StateFilter(None), ~F.text.startswith("/"))
+async def handle_auto_detect_posts(message: Message, bot: Bot, state: FSMContext):
+    user_id = message.from_user.id
+
+    if message.text in ["🚀 Start Task", "📊 Check Stats", "⏹ Finish Uploading", "⏹ Completed Uploading"]:
+        return
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT u.queue_id, u.name AS u_name, q.name AS q_name 
+            FROM uploaders u 
+            JOIN queues q ON u.queue_id = q.id 
+            WHERE u.user_id = $1
+            """,
+            user_id
+        )
+
+    if not row or not row["queue_id"]:
+        if user_id == get_admin_id():
+            return
+        await cmd_start(message, state, bot)
+        return
+
+    session = upload_batches.get(user_id)
+    if not session:
+        session = UploadBatchSession(
+            user_id=user_id,
+            user_chat_id=message.chat.id,
+            queue_id=row["queue_id"],
+            uploader_name=row["u_name"],
+            queue_name=row["q_name"],
+            bot=bot
+        )
+        upload_batches[user_id] = session
+
+    content_hash = get_message_content_hash(message)
+    await session.add_post(message.chat.id, message.message_id, content_hash)
+
+
+# ==================== ADMIN PANEL & QUEUES ====================
+
+@router.message(Command("admin"))
+async def admin_panel(message: Message, state: FSMContext):
+    if message.from_user.id != get_admin_id():
+        return
+    await state.clear()
+    kb = await get_admin_main_kb()
+    await message.answer("⚙️ <b>Admin Control Panel</b>", parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_close")
+async def admin_close_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.answer("Closed")
+    await state.clear()
+    await callback.message.delete()
+
+
+@router.callback_query(F.data == "admin_back")
+async def admin_back(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    await state.clear()
+    kb = await get_admin_main_kb()
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "⚙️ <b>Admin Control Panel</b>", reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_create_queue")
+async def admin_create_queue_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer("Opening queue creator...")
+    if callback.from_user.id != get_admin_id():
+        return
+    await state.set_state(AdminStates.waiting_for_queue_name)
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "➕ <b>Create New Post Queue</b>\n\nSend title/name (e.g. <code>Marketing Pipeline</code>):\n\n<i>Send /cancel to discard.</i>")
+
+
+@router.callback_query(F.data == "admin_list_queues")
+async def admin_list_queues(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        queues = await conn.fetch("SELECT id, name FROM queues ORDER BY id ASC")
+
+    if not queues:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_hub")]])
+        await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "📂 No queues found. Create one first.", reply_markup=kb)
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=f"📁 {row['name']}", callback_data=f"q_view:{row['id']}")]
+        for row in queues
+    ]
+    buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_hub")])
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "📂 <b>Select a Queue to Configure:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("q_view:"))
+async def admin_queue_detail(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        q = await conn.fetchrow("SELECT * FROM queues WHERE id = $1", queue_id)
+        post_count = await conn.fetchval("SELECT COUNT(*) FROM posts WHERE queue_id = $1", queue_id)
+
+    if not q:
+        await callback.answer("Queue not found.", show_alert=True)
+        return
+
+    name = q["name"]
+    dest_str = q["destination"] or "Not configured"
+    is_running = queue_id in active_tasks and not active_tasks[queue_id].done()
+    status_str = "🟢 Active (Broadcasting)" if is_running else "⚪ Idle"
+
+    buttons = [
+        [InlineKeyboardButton(text="🚀 Open in Running Hub", callback_data=f"run_hub_q:{queue_id}")],
+        [
+            InlineKeyboardButton(text="🗑 Clear Posts", callback_data=f"q_clear_posts:{queue_id}"),
+            InlineKeyboardButton(text="❌ Delete Queue", callback_data=f"q_delete:{queue_id}")
+        ],
+        [InlineKeyboardButton(text="🔙 Back to Queues", callback_data="admin_list_queues")]
+    ]
+
+    text = (
+        f"📁 <b>Queue:</b> <code>{name}</code>\n\n"
+        f"• <b>Status:</b> {status_str}\n"
+        f"• <b>Total Stored Posts:</b> <code>{post_count}</code>\n"
+        f"• <b>Broadcast Target:</b> <code>{dest_str}</code>\n"
+        f"• <b>Lifetime Launches:</b> <code>{q['run_count']}</code> time(s)\n"
+    )
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("q_clear_posts:"))
+async def admin_clear_posts(callback: CallbackQuery, bot: Bot):
+    await callback.answer("Purged posts")
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM posts WHERE queue_id = $1", queue_id)
+
+    await dispatch_notification(bot, "🗑 <b>Queue Cleared:</b> All posts purged by admin.", queue_id=queue_id)
+    await admin_queue_detail(callback)
+
+
+@router.callback_query(F.data.startswith("q_delete:"))
+async def admin_delete_queue(callback: CallbackQuery):
+    await callback.answer("Deleted")
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+    if queue_id in active_tasks:
+        active_tasks[queue_id].cancel()
+        del active_tasks[queue_id]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM queues WHERE id = $1", queue_id)
+
+    await admin_list_queues(callback)
+
+
+# ==================== UPLOADER CONFIGURATION ====================
+
+@router.callback_query(F.data == "admin_add_uploader")
+async def admin_add_uploader_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        queues = await conn.fetch("SELECT id, name FROM queues ORDER BY id ASC")
+
+    if not queues:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")]])
+        await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "⚠️ Create at least one queue before registering uploaders.", reply_markup=kb)
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=f"📁 {row['name']}", callback_data=f"sel_q_uploader:{row['id']}")]
+        for row in queues
+    ]
+    buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")])
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "Select target queue for the new <b>Flezen Uploader</b>:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("sel_q_uploader:"))
+async def admin_select_queue_for_uploader(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+    await state.update_data(new_uploader_queue_id=queue_id)
+    await state.set_state(AdminStates.waiting_for_uploader_id)
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "👤 Send numeric <b>Telegram User ID</b> of the uploader:")
+
+
+@router.callback_query(F.data == "admin_view_uploaders")
+async def admin_view_uploaders(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+
+    now = datetime.utcnow()
+    day_ago = now - timedelta(days=1)
+    week_ago = now - timedelta(days=7)
+    month_ago = now - timedelta(days=30)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        uploaders = await conn.fetch("""
+            SELECT u.user_id, u.name, q.name AS q_name
+            FROM uploaders u
+            LEFT JOIN queues q ON u.queue_id = q.id
+            ORDER BY u.created_at DESC
+        """)
+
+        if not uploaders:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_matrix_hub")]])
+            await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "👥 No Flezen uploaders configured.", reply_markup=kb)
+            return
+
+        report = ["📊 <b>Flezen Uploaders & Performance:</b>\n"]
+        for row in uploaders:
+            uid = row["user_id"]
+            uname = row["name"]
+            qname = row["q_name"]
+
+            d_c = await conn.fetchval(
+                "SELECT COUNT(*) FROM user_logs WHERE user_id = $1 AND is_duplicate = FALSE AND created_at >= $2",
+                uid, day_ago
+            )
+            d_dup = await conn.fetchval(
+                "SELECT COUNT(*) FROM user_logs WHERE user_id = $1 AND is_duplicate = TRUE AND created_at >= $2",
+                uid, day_ago
+            )
+            w_c = await conn.fetchval(
+                "SELECT COUNT(*) FROM user_logs WHERE user_id = $1 AND is_duplicate = FALSE AND created_at >= $2",
+                uid, week_ago
+            )
+            m_c = await conn.fetchval(
+                "SELECT COUNT(*) FROM user_logs WHERE user_id = $1 AND is_duplicate = FALSE AND created_at >= $2",
+                uid, month_ago
+            )
+
+            dup_info = f" (⚠️ {d_dup} dups today)" if d_dup > 0 else ""
+            report.append(
+                f"👤 <b>{uname}</b> (<code>{uid}</code>)\n"
+                f"• Queue: <code>{qname or 'None'}</code>\n"
+                f"• Day: <code>{d_c}</code>{dup_info} | Week: <code>{w_c}</code> | Month: <code>{m_c}</code>\n"
+            )
+
+    text = "\n".join(report)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Matrix Hub", callback_data="admin_matrix_hub")]])
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, text, reply_markup=kb)
