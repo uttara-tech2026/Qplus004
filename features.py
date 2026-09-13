@@ -247,13 +247,13 @@ async def check_bot_broadcast_permission(bot: Bot, chat_id: str) -> str:
 
 # ==================== RATE-LIMITED NOTIFICATION DISPATCHER ====================
 
-async def safe_send_message(bot: Bot, chat_id: str | int, text: str) -> Optional[Message]:
+async def safe_send_message(bot: Bot, chat_id: str | int, text: str, reply_markup=None) -> Optional[Message]:
     try:
-        return await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        return await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=reply_markup)
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after + 0.5)
         try:
-            return await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+            return await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=reply_markup)
         except Exception:
             return None
     except Exception:
@@ -319,7 +319,6 @@ async def handle_join_request(event: ChatJoinRequest, bot: Bot):
         )
 
     if dest:
-        # Matured channels auto-accept by default; Unmatured channels only accept if accept_requests is toggled ON
         should_process = (not dest["is_unmatured"]) or dest["accept_requests"]
         if should_process:
             if chat_id not in active_join_tasks or active_join_tasks[chat_id].done():
@@ -562,7 +561,7 @@ class AdminStates(StatesGroup):
     waiting_for_uploader_name = State()
 
 
-# ==================== AUTO-DISCOVERY OF BOT'S CHANNELS/GROUPS ====================
+# ==================== AUTO-DISCOVERY & NOTIFICATION WITH ACTION BUTTONS ====================
 
 @router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=ADMINISTRATOR))
 async def bot_added_as_admin(event: ChatMemberUpdated, bot: Bot):
@@ -586,20 +585,78 @@ async def bot_added_as_admin(event: ChatMemberUpdated, bot: Bot):
         f"📢 <b>New Destination Connected!</b>\n\n"
         f"• <b>Title:</b> {chat_title}\n"
         f"• <b>ID:</b> <code>{chat_id}</code>\n"
-        f"• <b>Type:</b> {chat_type.capitalize()}\n"
-        f"• <b>Default Category:</b> 🟢 Matured Channel (Auto-Accept Joins Active)\n\n"
-        "All queues broadcasting to Matured channels will automatically deliver to this channel."
+        f"• <b>Type:</b> {chat_type.capitalize()}\n\n"
+        "Select an initial configuration for this destination:"
     )
-    await dispatch_notification(bot, log_msg)
+
+    setup_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🟢 Set as Matured Channel", callback_data=f"auto_setup_dest:{chat_id}:matured")],
+            [InlineKeyboardButton(text="⚪ Set as Unmatured Channel", callback_data=f"auto_setup_dest:{chat_id}:unmatured")],
+            [InlineKeyboardButton(text="📋 Set as Master Log", callback_data=f"auto_setup_dest:{chat_id}:master")],
+            [InlineKeyboardButton(text="🗑 Remove Channel", callback_data=f"dest_delete:{chat_id}")]
+        ]
+    )
 
     admin_target = get_admin_id()
     if admin_target:
-        await safe_send_message(bot, admin_target, log_msg)
+        await safe_send_message(bot, admin_target, log_msg, reply_markup=setup_kb)
+
+    await dispatch_notification(bot, log_msg)
+
+
+@router.callback_query(F.data.startswith("auto_setup_dest:"))
+async def admin_auto_setup_dest(callback: CallbackQuery, bot: Bot):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    parts = callback.data.split(":")
+    chat_id = parts[1]
+    choice = parts[2]
+
+    pool = await get_pool()
+    if choice == "matured":
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE destinations SET is_unmatured = FALSE, accept_requests = TRUE WHERE chat_id = $1",
+                chat_id
+            )
+        if chat_id not in active_join_tasks or active_join_tasks[chat_id].done():
+            task = asyncio.create_task(join_request_worker(bot, chat_id))
+            active_join_tasks[chat_id] = task
+        await callback.answer("Configured as Matured Channel!", show_alert=True)
+    elif choice == "unmatured":
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE destinations SET is_unmatured = TRUE, accept_requests = FALSE WHERE chat_id = $1",
+                chat_id
+            )
+        if chat_id in active_join_tasks:
+            active_join_tasks[chat_id].cancel()
+            del active_join_tasks[chat_id]
+        await callback.answer("Configured as Unmatured Channel!", show_alert=True)
+    elif choice == "master":
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO bot_settings (key, value)
+                VALUES ('master_log_chat_id', $1)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                chat_id
+            )
+        await callback.answer("Configured as Master Log Destination!", show_alert=True)
+
+    await render_dest_actions(callback, chat_id)
 
 
 @router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=(KICKED | LEFT | RESTRICTED | MEMBER)))
 async def bot_removed_from_admin(event: ChatMemberUpdated, bot: Bot):
     chat_id = str(event.chat.id)
+    if chat_id in active_join_tasks:
+        active_join_tasks[chat_id].cancel()
+        del active_join_tasks[chat_id]
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM destinations WHERE chat_id = $1", chat_id)
@@ -697,9 +754,10 @@ async def cmd_addest(message: Message, command: CommandObject):
 
     buttons = [
         [
-            InlineKeyboardButton(text="🟢 Keep as Matured", callback_data=f"dest_actions:{numerical_id}"),
-            InlineKeyboardButton(text="⚪ Convert to Unmatured", callback_data=f"dest_convert_unmatured:{numerical_id}")
+            InlineKeyboardButton(text="🟢 Set Matured", callback_data=f"dest_convert_matured:{numerical_id}"),
+            InlineKeyboardButton(text="⚪ Set Unmatured", callback_data=f"dest_convert_unmatured:{numerical_id}")
         ],
+        [InlineKeyboardButton(text="📋 Set Master Log", callback_data=f"dest_set_master:{numerical_id}")],
         [InlineKeyboardButton(text="⚙️ Open Channel Actions", callback_data=f"dest_actions:{numerical_id}")]
     ]
 
@@ -707,8 +765,8 @@ async def cmd_addest(message: Message, command: CommandObject):
         f"✅ <b>Destination Registered Successfully!</b>\n\n"
         f"• <b>Name:</b> {nickname}\n"
         f"• <b>ID:</b> <code>{numerical_id}</code>\n"
-        f"• <b>Category:</b> 🟢 <b>Matured Channel</b> (Auto-Accept Active)\n\n"
-        "Broadcasts running on Matured channels will automatically deliver to this channel.",
+        f"• <b>Category:</b> 🟢 <b>Matured Channel</b> (Default)\n\n"
+        "Configure category or master log destination below:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
@@ -837,7 +895,6 @@ async def broadcast_worker(bot: Bot, queue_id: int, target_scope: str = "both"):
                 queue_id
             )
 
-            # Universal Destination Selection based on chosen scope
             if target_scope == "matured":
                 target_dests = await conn.fetch(
                     "SELECT chat_id, title FROM destinations WHERE is_unmatured = FALSE"
@@ -914,7 +971,6 @@ async def broadcast_worker(bot: Bot, queue_id: int, target_scope: str = "both"):
 
         sent_count = 0
         for post in items:
-            # Deliver this exact post across all channels belonging to the active category
             for cid in target_chat_ids:
                 try:
                     await bot.copy_message(
@@ -1455,7 +1511,7 @@ async def render_dest_actions(callback: CallbackQuery, chat_id: str):
 
     buttons = []
 
-    # Category conversion: Strict mutual exclusivity
+    # Category conversion
     if is_unmatured:
         buttons.append([InlineKeyboardButton(text="🟢 Convert to Matured Channel", callback_data=f"dest_convert_matured:{chat_id}")])
         join_btn_text = "⏹ Pause Accepting Requests" if accept_requests else "▶️ Start Accepting Join Requests"
@@ -1465,6 +1521,7 @@ async def render_dest_actions(callback: CallbackQuery, chat_id: str):
 
     buttons.append([InlineKeyboardButton(text=f"⏱ Join Delay: {join_min}s - {join_max}s", callback_data=f"dest_prompt_join_delay:{chat_id}")])
     buttons.append([InlineKeyboardButton(text="📋 Set as Master Log", callback_data=f"dest_set_master:{chat_id}")])
+    buttons.append([InlineKeyboardButton(text="🗑 Remove Channel", callback_data=f"dest_delete:{chat_id}")])
     
     back_target = "unmatured" if is_unmatured else "matured"
     buttons.append([InlineKeyboardButton(text="🔙 Back to Channels", callback_data=f"admin_dest_list:{back_target}")])
@@ -1491,6 +1548,31 @@ async def admin_dest_actions(callback: CallbackQuery):
         return
     chat_id = callback.data.split(":")[1]
     await render_dest_actions(callback, chat_id)
+
+
+# ==================== REMOVE DESTINATION CHANNEL ====================
+
+@router.callback_query(F.data.startswith("dest_delete:"))
+async def admin_dest_delete(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    chat_id = callback.data.split(":")[1]
+
+    if chat_id in active_join_tasks:
+        active_join_tasks[chat_id].cancel()
+        del active_join_tasks[chat_id]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        dest = await conn.fetchrow("SELECT title FROM destinations WHERE chat_id = $1", chat_id)
+        await conn.execute("DELETE FROM destinations WHERE chat_id = $1", chat_id)
+        await conn.execute("DELETE FROM bot_settings WHERE key = 'master_log_chat_id' AND value = $1", chat_id)
+        await conn.execute("DELETE FROM join_requests WHERE chat_id = $1", chat_id)
+
+    title = dest["title"] if dest else chat_id
+    await callback.answer(f"Channel {title} removed!", show_alert=True)
+    await admin_view_destinations(callback)
 
 
 # ==================== CONVERSION: MATURED <-> UNMATURED ====================
@@ -1924,7 +2006,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
                     [InlineKeyboardButton(text="✅ Grant Access as Flezen Uploader", callback_data=f"grant_req:{user.id}")]
                 ]
             )
-            await safe_send_message(bot, current_admin, req_text)
+            await safe_send_message(bot, current_admin, req_text, reply_markup=grant_kb)
 
 
 @router.callback_query(F.data.startswith("grant_req:"))
