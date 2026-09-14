@@ -107,6 +107,7 @@ async def init_db():
                 run_count INT DEFAULT 0,
                 caption_header TEXT DEFAULT '',
                 caption_footer TEXT DEFAULT '',
+                replace_link_from TEXT DEFAULT '',
                 replace_link_target TEXT DEFAULT ''
             );
         """)
@@ -116,6 +117,7 @@ async def init_db():
         await conn.execute("ALTER TABLE queues ADD COLUMN IF NOT EXISTS run_count INT DEFAULT 0;")
         await conn.execute("ALTER TABLE queues ADD COLUMN IF NOT EXISTS caption_header TEXT DEFAULT '';")
         await conn.execute("ALTER TABLE queues ADD COLUMN IF NOT EXISTS caption_footer TEXT DEFAULT '';")
+        await conn.execute("ALTER TABLE queues ADD COLUMN IF NOT EXISTS replace_link_from TEXT DEFAULT '';")
         await conn.execute("ALTER TABLE queues ADD COLUMN IF NOT EXISTS replace_link_target TEXT DEFAULT '';")
 
         await conn.execute("""
@@ -245,18 +247,30 @@ def format_eta(seconds: float) -> str:
     return " ".join(parts)
 
 
-def apply_caption_rules(original_text: Optional[str], header: Optional[str], footer: Optional[str], replace_link: Optional[str]) -> Optional[str]:
+def apply_caption_rules(
+    original_text: Optional[str],
+    header: Optional[str],
+    footer: Optional[str],
+    replace_link_target: Optional[str],
+    replace_link_from: Optional[str] = ""
+) -> Optional[str]:
     text = original_text or ""
     header = (header or "").strip()
     footer = (footer or "").strip()
-    replace_link = (replace_link or "").strip()
+    replace_link_target = (replace_link_target or "").strip()
+    replace_link_from = (replace_link_from or "").strip()
 
     if not text and not header and not footer:
         return None
 
-    if replace_link and text:
-        tg_link_pattern = r"(https?://)?(www\.)?(t\.me|telegram\.me)/[a-zA-Z0-9_+]+"
-        text = re.sub(tg_link_pattern, replace_link, text)
+    if replace_link_target and text:
+        if replace_link_from:
+            # Case-insensitive replacement of the specific target link or text
+            text = re.sub(re.escape(replace_link_from), replace_link_target, text, flags=re.IGNORECASE)
+        else:
+            # Universal telegram link pattern (supports https://t.me/+, t.me/joinchat, @usernames, etc.)
+            tg_link_pattern = r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(?:\+[a-zA-Z0-9_\-]+|[a-zA-Z0-9_\-]+)"
+            text = re.sub(tg_link_pattern, replace_link_target, text)
 
     parts = []
     if header:
@@ -633,7 +647,7 @@ async def bot_added_as_admin(event: ChatMemberUpdated, bot: Bot):
     async with pool.acquire() as conn:
         master_dest = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
         
-        # If it's already the Master Log, do not add to destinations table
+        # If already the Master Log, do not add to broadcast destinations table
         if master_dest and master_dest == chat_id:
             await dispatch_notification(bot, f"ℹ️ Bot refreshed as Admin in Master Log channel: <b>{chat_title}</b>")
             return
@@ -683,7 +697,6 @@ async def admin_auto_setup_dest(callback: CallbackQuery, bot: Bot):
     pool = await get_pool()
     if choice == "matured":
         async with pool.acquire() as conn:
-            # Unset if it was master log
             await conn.execute("DELETE FROM bot_settings WHERE key = 'master_log_chat_id' AND value = $1", chat_id)
             await conn.execute(
                 "UPDATE destinations SET is_unmatured = FALSE, accept_requests = TRUE WHERE chat_id = $1",
@@ -697,7 +710,6 @@ async def admin_auto_setup_dest(callback: CallbackQuery, bot: Bot):
 
     elif choice == "unmatured":
         async with pool.acquire() as conn:
-            # Unset if it was master log
             await conn.execute("DELETE FROM bot_settings WHERE key = 'master_log_chat_id' AND value = $1", chat_id)
             await conn.execute(
                 "UPDATE destinations SET is_unmatured = TRUE, accept_requests = FALSE WHERE chat_id = $1",
@@ -710,7 +722,6 @@ async def admin_auto_setup_dest(callback: CallbackQuery, bot: Bot):
         await render_dest_actions(callback, chat_id)
 
     elif choice == "master":
-        # Completely isolate from broadcast destinations table
         if chat_id in active_join_tasks:
             active_join_tasks[chat_id].cancel()
             del active_join_tasks[chat_id]
@@ -725,7 +736,7 @@ async def admin_auto_setup_dest(callback: CallbackQuery, bot: Bot):
                 """,
                 chat_id
             )
-        await callback.answer("Set as Master Log! It will only receive notifications/logs and is excluded from broadcasts.", show_alert=True)
+        await callback.answer("Set as Master Log! Excluded from regular broadcasts.", show_alert=True)
         await admin_set_master_log_screen(callback)
 
 
@@ -982,7 +993,7 @@ async def broadcast_worker(bot: Bot, queue_id: int, target_scope: str = "both"):
         async with pool.acquire() as conn:
             await conn.execute("UPDATE queues SET run_count = run_count + 1 WHERE id = $1", queue_id)
             q = await conn.fetchrow(
-                "SELECT name, delay_sec, delay_min, delay_max, delay_type, mode, caption_header, caption_footer, replace_link_target FROM queues WHERE id = $1",
+                "SELECT name, delay_sec, delay_min, delay_max, delay_type, mode, caption_header, caption_footer, replace_link_from, replace_link_target FROM queues WHERE id = $1",
                 queue_id
             )
             master_dest = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
@@ -1026,7 +1037,8 @@ async def broadcast_worker(bot: Bot, queue_id: int, target_scope: str = "both"):
         mode = q["mode"] or "sequence"
         c_header = q["caption_header"]
         c_footer = q["caption_footer"]
-        c_link = q["replace_link_target"]
+        c_from = q["replace_link_from"]
+        c_target = q["replace_link_target"]
 
         dest_display = f"{len(target_chat_ids)} channel(s) ({', '.join(target_titles[:3])}{'...' if len(target_titles) > 3 else ''})"
 
@@ -1070,7 +1082,7 @@ async def broadcast_worker(bot: Bot, queue_id: int, target_scope: str = "both"):
 
         sent_count = 0
         for post in items:
-            final_caption = apply_caption_rules(post["caption"], c_header, c_footer, c_link)
+            final_caption = apply_caption_rules(post["caption"], c_header, c_footer, c_target, c_from)
             kwargs = {}
             if final_caption is not None:
                 kwargs["caption"] = final_caption
@@ -1472,7 +1484,7 @@ async def render_queue_caption_screen(callback: CallbackQuery, queue_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
         q = await conn.fetchrow(
-            "SELECT name, caption_header, caption_footer, replace_link_target FROM queues WHERE id = $1",
+            "SELECT name, caption_header, caption_footer, replace_link_from, replace_link_target FROM queues WHERE id = $1",
             queue_id
         )
 
@@ -1482,12 +1494,14 @@ async def render_queue_caption_screen(callback: CallbackQuery, queue_id: int):
 
     h = q["caption_header"] or "<i>None</i>"
     f = q["caption_footer"] or "<i>None</i>"
-    l = q["replace_link_target"] or "<i>None</i>"
+    target = q["replace_link_target"] or "<i>None</i>"
+    source = q["replace_link_from"] or "<i>All Telegram Links (*)</i>"
 
     buttons = [
         [InlineKeyboardButton(text="🏷 Set Header", callback_data=f"set_q_header:{queue_id}")],
         [InlineKeyboardButton(text="📝 Set Footer", callback_data=f"set_q_footer:{queue_id}")],
         [InlineKeyboardButton(text="🔗 Set Link Replacement", callback_data=f"set_q_link:{queue_id}")],
+        [InlineKeyboardButton(text="👁 Check Real-Life Sample", callback_data=f"preview_q_sample:{queue_id}")],
         [InlineKeyboardButton(text="🗑 Reset Caption Rules", callback_data=f"reset_q_caption:{queue_id}")],
         [InlineKeyboardButton(text="🔙 Back to Queues", callback_data="admin_caption_hub")]
     ]
@@ -1496,7 +1510,8 @@ async def render_queue_caption_screen(callback: CallbackQuery, queue_id: int):
         f"✏️ <b>Caption Rules for:</b> <code>{q['name']}</code>\n\n"
         f"• <b>Header (Prepended):</b>\n{h}\n\n"
         f"• <b>Footer (Appended):</b>\n{f}\n\n"
-        f"• <b>Telegram Link Replacement:</b>\n{l}\n\n"
+        f"• <b>Target To Find:</b>\n{source}\n\n"
+        f"• <b>Replace With:</b>\n{target}\n\n"
         "All broadcasts originating from this queue will automatically adopt these formatting rules."
     )
     await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, card, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
@@ -1540,7 +1555,10 @@ async def admin_save_q_header(message: Message, state: FSMContext):
         await conn.execute("UPDATE queues SET caption_header = $1 WHERE id = $2", val, queue_id)
 
     await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Caption Rules", callback_data=f"q_caption_edit:{queue_id}")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👁 Check Sample", callback_data=f"preview_q_sample:{queue_id}")],
+        [InlineKeyboardButton(text="🔙 Back to Caption Rules", callback_data=f"q_caption_edit:{queue_id}")]
+    ])
     await message.answer("✅ Header updated successfully.", reply_markup=kb)
 
 
@@ -1573,7 +1591,10 @@ async def admin_save_q_footer(message: Message, state: FSMContext):
         await conn.execute("UPDATE queues SET caption_footer = $1 WHERE id = $2", val, queue_id)
 
     await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Caption Rules", callback_data=f"q_caption_edit:{queue_id}")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👁 Check Sample", callback_data=f"preview_q_sample:{queue_id}")],
+        [InlineKeyboardButton(text="🔙 Back to Caption Rules", callback_data=f"q_caption_edit:{queue_id}")]
+    ])
     await message.answer("✅ Footer updated successfully.", reply_markup=kb)
 
 
@@ -1585,11 +1606,23 @@ async def admin_set_q_link_prompt(callback: CallbackQuery, state: FSMContext):
     queue_id = int(callback.data.split(":")[1])
     await state.update_data(active_caption_qid=queue_id)
     await state.set_state(AdminStates.waiting_for_caption_link)
+    
+    prompt_text = (
+        "🔗 <b>Set Link / Text Replacement</b>\n\n"
+        "You can specify both the link/text to find and what to replace it with, OR provide just the new link to replace all Telegram links.\n\n"
+        "<b>Option 1: Specific Link/Text Replacement</b>\n"
+        "Format: <code>old_link -> new_link</code>\n"
+        "Example: <code>https://t.me/+xyzzz -> https://t.me/MyTargetChannel</code>\n\n"
+        "<b>Option 2: Replace All Telegram Links</b>\n"
+        "Send just the new link:\n"
+        "Example: <code>https://t.me/MyTargetChannel</code>\n\n"
+        "<i>Send <code>/clear</code> to disable link replacement.</i>"
+    )
     await safe_edit_message(
         callback.message.bot,
         callback.message.chat.id,
         callback.message.message_id,
-        "🔗 <b>Send Telegram Link / Username Replacement:</b>\n\nExample: <code>https://t.me/YourChannel</code> or <code>@YourChannel</code>\n\nAll existing Telegram links in the post will be replaced with this link. Send <code>/clear</code> to disable:"
+        prompt_text
     )
 
 
@@ -1599,15 +1632,125 @@ async def admin_save_q_link(message: Message, state: FSMContext):
         return
     data = await state.get_data()
     queue_id = data["active_caption_qid"]
-    val = "" if message.text.strip() == "/clear" else message.text.strip()
+    raw = message.text.strip()
+
+    if raw == "/clear":
+        from_target = ""
+        to_target = ""
+    else:
+        sep = None
+        for s in ["->", "=>", "|", "\n"]:
+            if s in raw:
+                sep = s
+                break
+        if sep:
+            parts = raw.split(sep, 1)
+            from_target = parts[0].strip()
+            to_target = parts[1].strip()
+        else:
+            from_target = ""
+            to_target = raw
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("UPDATE queues SET replace_link_target = $1 WHERE id = $2", val, queue_id)
+        await conn.execute(
+            "UPDATE queues SET replace_link_from = $1, replace_link_target = $2 WHERE id = $3",
+            from_target, to_target, queue_id
+        )
 
     await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Caption Rules", callback_data=f"q_caption_edit:{queue_id}")]])
-    await message.answer("✅ Link replacement target updated successfully.", reply_markup=kb)
+    
+    preview_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👁 Check Real-Life Sample", callback_data=f"preview_q_sample:{queue_id}")],
+        [InlineKeyboardButton(text="⚙️ Caption Settings", callback_data=f"q_caption_edit:{queue_id}")],
+        [InlineKeyboardButton(text="🚀 Back to Queue", callback_data=f"run_hub_q:{queue_id}")]
+    ])
+
+    if not to_target:
+        await message.answer("✅ Link replacement disabled.", reply_markup=preview_kb)
+    else:
+        match_desc = f"<code>{from_target}</code>" if from_target else "<i>All Telegram links (*.t.me/...)</i>"
+        await message.answer(
+            f"✅ <b>Link Replacement Configured Successfully!</b>\n\n"
+            f"• <b>Target To Find:</b> {match_desc}\n"
+            f"• <b>Replace With:</b> <code>{to_target}</code>\n\n"
+            "Tap below to verify with a live real-life sample preview:",
+            parse_mode="HTML",
+            reply_markup=preview_kb
+        )
+
+
+# ==================== REAL-LIFE SAMPLE PREVIEW ====================
+
+@router.callback_query(F.data.startswith("preview_q_sample:"))
+async def admin_preview_q_sample(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+    queue_id = int(callback.data.split(":")[1])
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        q = await conn.fetchrow(
+            "SELECT name, caption_header, caption_footer, replace_link_from, replace_link_target FROM queues WHERE id = $1",
+            queue_id
+        )
+        sample_post = await conn.fetchrow(
+            "SELECT caption FROM posts WHERE queue_id = $1 AND caption IS NOT NULL AND caption != '' ORDER BY id DESC LIMIT 1",
+            queue_id
+        )
+
+    if not q:
+        await callback.answer("Queue not found.", show_alert=True)
+        return
+
+    header = q["caption_header"]
+    footer = q["caption_footer"]
+    target = q["replace_link_target"]
+    source = q["replace_link_from"]
+
+    if sample_post and sample_post["caption"]:
+        orig_caption = sample_post["caption"]
+        is_real = True
+    else:
+        test_link = source if source else "https://t.me/+xyzzz"
+        orig_caption = (
+            f"🔥 Exclusive Daily News & Updates!\n\n"
+            f"Join our private chat room right now: {test_link}\n"
+            f"Contact admin support for help."
+        )
+        is_real = False
+
+    transformed_caption = apply_caption_rules(orig_caption, header, footer, target, source)
+
+    buttons = [
+        [InlineKeyboardButton(text="🔄 Refresh Sample", callback_data=f"preview_q_sample:{queue_id}")],
+        [InlineKeyboardButton(text="✏️ Edit Caption Rules", callback_data=f"q_caption_edit:{queue_id}")],
+        [InlineKeyboardButton(text="🔙 Back to Queue Scheduler", callback_data=f"run_hub_q:{queue_id}")]
+    ]
+
+    preview_text = (
+        f"👁 <b>Real-Life Caption Sample Preview</b>\n"
+        f"• <b>Queue:</b> <code>{q['name']}</code>\n"
+        f"• <b>Data Source:</b> {'<i>Stored post from database</i>' if is_real else '<i>Simulated post</i>'}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>📥 ORIGINAL CAPTION:</b>\n"
+        f"{orig_caption}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>📤 TRANSFORMED OUTPUT:</b>\n"
+        f"{transformed_caption or '<i>(No text/caption generated)</i>'}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Target To Find:</b> <code>{source or 'All Telegram links (*)'}</code>\n"
+        f"• <b>Replace With:</b> <code>{target or 'None'}</code>"
+    )
+
+    await safe_edit_message(
+        callback.message.bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+        preview_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
 
 
 @router.callback_query(F.data.startswith("reset_q_caption:"))
@@ -1620,7 +1763,7 @@ async def admin_reset_q_caption(callback: CallbackQuery):
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE queues SET caption_header = '', caption_footer = '', replace_link_target = '' WHERE id = $1",
+            "UPDATE queues SET caption_header = '', caption_footer = '', replace_link_from = '', replace_link_target = '' WHERE id = $1",
             queue_id
         )
 
@@ -2341,7 +2484,8 @@ async def admin_set_master_log_screen(callback: CallbackQuery):
     if current_master:
         buttons.append([InlineKeyboardButton(text="🗑 Disconnect Master Log", callback_data="admin_clear_master_log")])
 
-    buttons.append([InlineKeyboardButton(text="🔙 Back to Admin Menu", callback_data="admin_back")])
+    buttons.append([InlineKeyboardButton(text="🔙 Back to Admin Menu", callback_data="admin_back")]
+    )
 
     text = (
         "📋 <b>Master Log Channel Configuration</b>\n\n"
@@ -2388,7 +2532,6 @@ async def admin_master_log_manual_save(message: Message, state: FSMContext, bot:
     target = message.text.strip()
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # Remove from destinations so it will never be broadcasted to
         await conn.execute("DELETE FROM destinations WHERE chat_id = $1", target)
         await conn.execute(
             """
